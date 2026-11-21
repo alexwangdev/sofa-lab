@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "sofa-lab-local",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "local"
+      ],
+      "port": 5199
+    }
+  ]
+}
