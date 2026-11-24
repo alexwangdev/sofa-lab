@@ -2,7 +2,7 @@
 import { memo, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import type { PointerEvent as RPointerEvent, Ref } from 'react';
 import { BIOMES } from '../shared/biomes.ts';
-import { segmentOf } from '../shared/grid.ts';
+import { biomeAt, segmentOf } from '../shared/grid.ts';
 import { IN, TICK, heldCodes, newRun, startRun, tick } from '../shared/sim.ts';
 import { decide } from '../shared/autopilot.ts';
 import type { GameEvent, RunState } from '../shared/sim.ts';
@@ -10,7 +10,8 @@ import { vehicle } from '../shared/vehicles.ts';
 import type { Course } from '../shared/types.ts';
 import { drawFrame, newFx, setDrawDistance } from './render.ts';
 import { readyToStart } from './atlas.ts';
-import { installSfx, sfxEvent, sfxFrame, sfxQuiet } from './sfx.ts';
+import { keepAhead } from '../shared/endless.ts';
+import { installSfx, sfxEvent, sfxFrame } from './sfx.ts';
 import { musicFrame, musicQuiet } from './music.ts';
 
 /**
@@ -38,6 +39,8 @@ export type CanvasHandle = {
 };
 
 type Props = {
+  /** The run screen is showing. While it is hidden (track preview, gallery) keys are ignored and nothing is drawn. */
+  active: boolean;
   course: Course;
   parSeconds: number;
   autoStart: boolean;
@@ -77,7 +80,7 @@ function applyEvent(fx: Fx, s: RunState, e: GameEvent): void {
       });
     }
   };
-  const pal = BIOMES[s.course.biomes[segmentOf(e.row)]].palette;
+  const pal = BIOMES[biomeAt(s.course, e.row)].palette;
   switch (e.kind) {
     case 'gate':
       toast(`GATE +${e.points}`, '#2563eb');
@@ -109,11 +112,11 @@ function applyEvent(fx: Fx, s: RunState, e: GameEvent): void {
       burst(16, ['#facc15', '#fef9c3'], 1.2);
       break;
     case 'expire':
-      toast(`${vehicle(BIOMES[s.course.biomes[segmentOf(e.row)]].base).name} again`, '#475569');
+      toast(`${vehicle(BIOMES[biomeAt(s.course, e.row)].base).name} again`, '#475569');
       break;
     case 'biome': {
-      const b = BIOMES[s.course.biomes[segmentOf(e.row)]];
-      fx.banner = { title: `${b.name} — ${vehicle(b.base).name}`, sub: `Segment ${segmentOf(e.row) + 1} of 3`, age: 0 };
+      const b = BIOMES[biomeAt(s.course, e.row)];
+      fx.banner = { title: `${b.name} — ${vehicle(b.base).name}`, sub: s.course.endless ? `Biome ${segmentOf(e.row) + 1}` : `Segment ${segmentOf(e.row) + 1} of 3`, age: 0 };
       break;
     }
     case 'crash':
@@ -153,9 +156,11 @@ function stepFx(fx: Fx, s: RunState, dt: number): void {
 }
 
 /** Memoised: the HUD re-renders App ~10×/s and must not re-render the canvas component with it. */
-export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeconds, autoStart, autoPilot = false, onTick, onEnd, onRetry, ref }: Props) {
+export const ExpeditionCanvas = memo(function ExpeditionCanvas({ active, course, parSeconds, autoStart, autoPilot = false, onTick, onEnd, onRetry, ref }: Props) {
   const pilotRef = useRef(autoPilot);
   pilotRef.current = autoPilot;
+  const activeRef = useRef(active);
+  activeRef.current = active;
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const runRef = useRef<RunState>(newRun(course, parSeconds));
@@ -197,7 +202,7 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
   const doStart = () => {
     const s = runRef.current;
     if (s.phase === 'ready') {
-      if (!readyToStart(s.course.biomes[0])) return; // first biome still downloading (the overlay says so)
+      if (!readyToStart(biomeAt(s.course, 0))) return; // first biome still downloading (the overlay says so)
       startRun(s);
       cb.current.onTick(s);
     } else if (s.phase !== 'run') cb.current.onRetry();
@@ -231,6 +236,7 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
     if (!el) return;
     const ro = new ResizeObserver(() => {
       const w = Math.min(480, Math.floor(el.clientWidth));
+      if (w === 0) return; // hidden: keep the last size
       const h = Math.max(300, Math.min(Math.round(w * 1.5), window.innerHeight - 250));
       setSize((p) => (p.w === w && p.h === h ? p : { w, h }));
     });
@@ -265,7 +271,7 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
       const before = s.phase;
       const h = held.current;
       const pilot = pilotRef.current;
-      if ((pilot || autoStartRef.current) && s.phase === 'ready' && readyToStart(s.course.biomes[0])) {
+      if ((pilot || autoStartRef.current) && s.phase === 'ready' && readyToStart(biomeAt(s.course, 0))) {
         autoStartRef.current = false;
         startRun(s);
         cb.current.onTick(s);
@@ -279,6 +285,7 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
           steer(ks.dir);
           ks.next = fx.clock + REPEAT_EVERY;
         }
+        if (s.course.endless) keepAhead(s); // grow the track ahead, forget what is far behind
         acc += dt;
         while (acc >= TICK && s.phase === 'run') {
           acc -= TICK;
@@ -304,7 +311,6 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
       }
       s.events.length = 0;
       if (pausedRef.current) {
-        sfxQuiet();
         musicQuiet();
       } else {
         sfxFrame(s, dt);
@@ -315,6 +321,10 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
       if (fx.clock >= tickAt) {
         tickAt = fx.clock + 0.1;
         cb.current.onTick(s);
+      }
+      if (!activeRef.current) {
+        raf = requestAnimationFrame(frame);
+        return;
       }
       ctx.setTransform(k, 0, 0, k, 0, 0);
       const t0 = performance.now();
@@ -342,6 +352,7 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
     const isUp = (k2: string) => k2 === 'ArrowUp' || k2 === 'w' || k2 === 'W';
     const isDown = (k2: string) => k2 === 'ArrowDown' || k2 === 's' || k2 === 'S';
     const kd = (e: KeyboardEvent) => {
+      if (!activeRef.current) return;
       if (e.target instanceof HTMLElement && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT')) return;
       if (isL(e.key) || isR(e.key) || isUp(e.key) || isDown(e.key) || e.key === ' ') e.preventDefault();
       if (e.repeat) return;
@@ -384,7 +395,6 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
     document.addEventListener('visibilitychange', vis);
     return () => {
       cancelAnimationFrame(raf);
-      sfxQuiet();
       musicQuiet();
       window.removeEventListener('keydown', kd);
       window.removeEventListener('keyup', ku);

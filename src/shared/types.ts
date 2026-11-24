@@ -51,8 +51,11 @@ export type Pickup = { row: number; lane: number; vehicle: VehicleId; segment: n
 export type Course = {
   date: string;
   seed: number;
-  biomes: readonly [BiomeId, BiomeId, BiomeId];
+  /** One biome per segment of SEG_ROWS rows: 3 on a daily track, growing on an endless one. */
+  biomes: readonly BiomeId[];
   rows: number;
+  /** Endless track: no finish line; endless.ts appends legs ahead of the runner. */
+  endless?: boolean;
   cols: number;
   cells: Uint8Array;
   /** Guaranteed-clear lane per row (generation only, never shown to the player). */

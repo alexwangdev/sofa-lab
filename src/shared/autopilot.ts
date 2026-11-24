@@ -5,7 +5,7 @@
  * further ahead, then the best score. Speed never changes which rows are safe (rules resolve per row), so it can
  * hold Tuck the whole way.
  */
-import { COLS, FINISH_ROW, cellAt } from './grid.ts';
+import { COLS, cellAt, finishRow } from './grid.ts';
 import { enterRow, maxLanesFor, nextRow, score } from './sim.ts';
 import type { RunState } from './sim.ts';
 import { Cell } from './types.ts';
@@ -21,7 +21,7 @@ function clone(s: RunState): RunState {
 /** Can a plain one-lane-per-row runner get from (row, lane) through the next `horizon` rows without a Crash cell? */
 function survivable(course: Course, row: number, lane: number, horizon: number): boolean {
   let reach = 1 << lane;
-  const end = Math.min(FINISH_ROW, row + horizon);
+  const end = Math.min(finishRow(course), row + horizon);
   for (let r = row + 1; r <= end; r++) {
     let next = 0;
     for (let l = 0; l < COLS; l++) {

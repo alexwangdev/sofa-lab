@@ -2,8 +2,9 @@
  * Sound, synthesised at run time with the Web Audio API: no audio files, nothing to license, nothing to download.
  *
  * - One-shot effects (gate, collect, crash, …) are short oscillator / filtered-noise envelopes built per call.
- * - The ride sound is a looped noise buffer through a filter, plus an optional engine oscillator and hoof/paw steps,
- *   shaped every frame by the current vehicle and speed (`sfxFrame`).
+ * - No continuous ride sound (no sliding hiss, no engine drone): it sat under everything for the whole run. Moving is
+ *   heard only as short sounds: a swish on lane changes, a thump on landing, and hoof / paw / wheel steps for the
+ *   vehicles that have them (`sfxFrame`).
  *
  * Browsers only allow audio after a user gesture, so the AudioContext is created on the first key / pointer press.
  * The sound mode (all / effects only / off) is remembered in localStorage. Background music lives in music.ts and
@@ -14,36 +15,11 @@ import type { GameEvent, RunState } from '../shared/sim.ts';
 import type { VehicleId } from '../shared/types.ts';
 
 const MUTE_KEY = 'grid-expedition:sound';
-const MASTER = 0.5;
+/** Overall level (the compressor after it catches peaks). */
+const MASTER = 0.9;
 
-/** How a vehicle sounds while moving: noise (filter type, centre Hz, Q, level), engine (base Hz, level), steps per second. */
-type Ride = { f: BiquadFilterType; hz: number; q: number; vol: number; engine?: number; ev?: number; steps?: number };
-const GLIDE: Ride = { f: 'bandpass', hz: 3200, q: 0.6, vol: 0.32 };
-const RIDES: Partial<Record<VehicleId, Ride>> = {
-  ski: GLIDE,
-  sandboard: { f: 'bandpass', hz: 1400, q: 0.5, vol: 0.34 },
-  heatboard: { f: 'highpass', hz: 2500, q: 0.7, vol: 0.22 },
-  lavasurf: { f: 'lowpass', hz: 500, q: 1.5, vol: 0.5 },
-  skates: { f: 'bandpass', hz: 5500, q: 1.2, vol: 0.28 },
-  skateboard: { f: 'lowpass', hz: 700, q: 0.8, vol: 0.5 },
-  bicycle: { f: 'bandpass', hz: 900, q: 0.8, vol: 0.2, steps: 3 },
-  jetski: { f: 'lowpass', hz: 900, q: 0.7, vol: 0.4, engine: 70, ev: 0.06 },
-  speedboat: { f: 'lowpass', hz: 900, q: 0.7, vol: 0.4, engine: 55, ev: 0.08 },
-  submarine: { f: 'lowpass', hz: 260, q: 2, vol: 0.5, engine: 40, ev: 0.05 },
-  snowmobile: { f: 'bandpass', hz: 2600, q: 0.6, vol: 0.22, engine: 62, ev: 0.08 },
-  dunebuggy: { f: 'bandpass', hz: 1200, q: 0.5, vol: 0.22, engine: 48, ev: 0.09 },
-  rover: { f: 'lowpass', hz: 400, q: 0.6, vol: 0.18, engine: 90, ev: 0.05 },
-  icebreaker: { f: 'lowpass', hz: 600, q: 1, vol: 0.4, engine: 38, ev: 0.09 },
-  subway: { f: 'lowpass', hz: 500, q: 1, vol: 0.4, engine: 45, ev: 0.06, steps: 2 },
-  helicopter: { f: 'lowpass', hz: 300, q: 0.8, vol: 0.35, engine: 30, ev: 0.1 },
-  rocket: { f: 'lowpass', hz: 1800, q: 0.4, vol: 0.45 },
-  balloon: { f: 'bandpass', hz: 600, q: 0.4, vol: 0.12 },
-  zipline: { f: 'bandpass', hz: 4200, q: 3, vol: 0.2 },
-  oxcart: { f: 'lowpass', hz: 350, q: 0.8, vol: 0.3, steps: 2.2 },
-  elephant: { f: 'lowpass', hz: 300, q: 0.8, vol: 0.25, steps: 1.4 },
-  dogsled: { f: 'bandpass', hz: 3000, q: 0.6, vol: 0.25, steps: 5 },
-  dogteam: { f: 'bandpass', hz: 4500, q: 0.8, vol: 0.22, steps: 5 },
-};
+/** Steps per second at cruise for vehicles that have feet or rails (hooves, paws, wheels on joints). */
+const STEPS: Partial<Record<VehicleId, number>> = { bicycle: 3, subway: 2, oxcart: 2.2, elephant: 1.4, dogsled: 5, dogteam: 5 };
 const HEAVY_STEPS = new Set<VehicleId>(['oxcart', 'elephant']);
 
 export type SoundMode = 'all' | 'sfx' | 'off';
@@ -56,11 +32,9 @@ let mode: SoundMode = (() => {
   }
 })();
 
-type Loop = { filter: BiquadFilterNode; ng: GainNode; osc: OscillatorNode; lp: BiquadFilterNode; eg: GainNode };
 let ac: AudioContext | null = null;
 let master: GainNode | null = null;
 let noiseBuf: AudioBuffer | null = null;
-let loop: Loop | null = null;
 
 function ensure(): AudioContext | null {
   if (ac) return ac;
@@ -87,8 +61,8 @@ export function installSfx(): void {
     const c = ensure();
     if (c && c.state === 'suspended' && document.visibilityState === 'visible') void c.resume();
   };
-  window.addEventListener('pointerdown', unlock, true);
-  window.addEventListener('keydown', unlock, true);
+  // pointerdown counts as a user gesture only for a mouse; on touch screens the gesture is pointerup / touchend / click
+  for (const type of ['pointerdown', 'pointerup', 'touchend', 'click', 'keydown']) window.addEventListener(type, unlock, true);
   document.addEventListener('visibilitychange', () => {
     if (!ac) return;
     if (document.visibilityState === 'hidden') void ac.suspend();
@@ -226,51 +200,27 @@ export function sfxEvent(s: RunState, e: GameEvent): void {
   }
 }
 
-function makeLoop(c: AudioContext, out: GainNode): Loop {
-  const noiseSrc = c.createBufferSource();
-  noiseSrc.buffer = noiseBuf;
-  noiseSrc.loop = true;
-  const filter = c.createBiquadFilter();
-  const ng = c.createGain();
-  ng.gain.value = 0;
-  noiseSrc.connect(filter).connect(ng).connect(out);
-  const osc = c.createOscillator();
-  osc.type = 'sawtooth';
-  const lp = c.createBiquadFilter();
-  lp.type = 'lowpass';
-  lp.frequency.value = 700;
-  const eg = c.createGain();
-  eg.gain.value = 0;
-  osc.connect(lp).connect(eg).connect(out);
-  noiseSrc.start();
-  osc.start();
-  return { filter, ng, osc, lp, eg };
-}
-
 /** Per-run memory for edges (start, lane change, landing, steps). */
-let seen: { run: RunState | null; phase: string; lane: number; air: boolean; ride: Ride | null; step: number } = { run: null, phase: '', lane: 0, air: false, ride: null, step: 0 };
+let seen: { run: RunState | null; phase: string; lane: number; air: boolean; step: number } = { run: null, phase: '', lane: 0, air: false, step: 0 };
 
-/** Every frame: ride sound follows vehicle and speed; plays start / lane-change / landing / step sounds. */
+/** Every frame: start beep, lane-change swish, landing thump, and steps for vehicles with feet. */
 export function sfxFrame(s: RunState, dt: number): void {
-  const c = live();
-  if (!c || !master) return;
-  if (seen.run !== s) seen = { run: s, phase: s.phase, lane: s.lane, air: false, ride: null, step: 0 };
-  loop ??= makeLoop(c, master);
-  const t = c.currentTime;
+  if (!live()) return;
+  if (seen.run !== s) seen = { run: s, phase: s.phase, lane: s.lane, air: false, step: 0 };
   const running = s.phase === 'run';
   const air = running && s.row <= s.airUntil;
   const v = vehicleFor(s, s.row);
-  const ride = RIDES[v.id] ?? GLIDE;
   const sp = Math.max(0, Math.min(1, (s.speed - 3) / 14));
 
   if (seen.phase === 'ready' && running) notes([660, 880], 0.09, 0.12, { type: 'triangle', vol: 0.16 });
-  if (running && !air && s.lane !== seen.lane) noise(0.12, { hz: ride.hz * 0.8, hz1: ride.hz * 1.3, q: 1, vol: 0.18, attack: 0.02 });
+  if (running && !air && s.lane !== seen.lane) noise(0.12, { hz: 1900, hz1: 3200, q: 1, vol: 0.18, attack: 0.02 });
   if (seen.air && !air && running) {
     noise(0.16, { f: 'lowpass', hz: 700, hz1: 150, vol: 0.45 });
     tone(110, 55, 0.14, { type: 'sine', vol: 0.3 });
   }
-  if (running && !air && ride.steps) {
-    seen.step += dt * ride.steps * (0.6 + sp * 0.8);
+  const steps = STEPS[v.id];
+  if (running && !air && steps) {
+    seen.step += dt * steps * (0.6 + sp * 0.8);
     if (seen.step >= 1) {
       seen.step -= 1;
       if (HEAVY_STEPS.has(v.id)) tone(140, 90, 0.07, { type: 'sine', vol: 0.22 });
@@ -278,27 +228,7 @@ export function sfxFrame(s: RunState, dt: number): void {
     }
   }
 
-  if (ride !== seen.ride) {
-    loop.filter.type = ride.f;
-    loop.filter.Q.setTargetAtTime(ride.q, t, 0.05);
-  }
-  loop.filter.frequency.setTargetAtTime(ride.hz * (0.7 + sp * 0.6) * (air ? 1.6 : 1), t, 0.08);
-  const nv = running ? (air ? 0.08 : ride.vol * (0.35 + sp * 0.65)) : 0;
-  loop.ng.gain.setTargetAtTime(nv, t, running ? 0.08 : 0.15);
-  const ev = running && ride.engine ? (ride.ev ?? 0.06) * (air ? 0.6 : 1) : 0;
-  if (ride.engine) loop.osc.frequency.setTargetAtTime(ride.engine * (1 + sp * 1.4), t, 0.1);
-  loop.lp.frequency.setTargetAtTime(400 + sp * 900, t, 0.1);
-  loop.eg.gain.setTargetAtTime(ev, t, 0.1);
-
   seen.phase = s.phase;
   seen.lane = s.lane;
   seen.air = air;
-  seen.ride = ride;
-}
-
-/** Fade the ride sound out (run screen closed). */
-export function sfxQuiet(): void {
-  if (!ac || !loop) return;
-  loop.ng.gain.setTargetAtTime(0, ac.currentTime, 0.05);
-  loop.eg.gain.setTargetAtTime(0, ac.currentTime, 0.05);
 }

@@ -87,7 +87,7 @@ The preview shows this legend for each of the day's three biomes. The TEST bar h
   - **start**: two beeps
   - **lane change**: a short swish
   - The same sound is played at most once per 45 ms.
-- **Ride sound**: a looped noise buffer through a filter, plus an optional sawtooth engine and hoof or paw steps. Each vehicle has its own setting in `RIDES`, for example a hiss for skis, a low rumble for the skateboard, an engine for the jet ski, and slow hoof thuds for the ox cart. Pitch and volume follow speed, and the sound goes nearly silent in the air.
+- **No continuous ride sound.** There is no sliding hiss and no engine drone: they ran for the whole run and covered the music. Moving is heard only as short sounds: the lane-change swish, the landing thump, and steps for vehicles with feet or wheels on joints (`STEPS`). The ox cart and elephant get heavy hoof thuds; dog sleds, the dog team, the bicycle and the subway get light ticks.
 - The audio starts on the first key or tap, because browsers require a gesture. Audio is suspended while the tab is hidden.
 - The run header has a button that cycles **Sound** (music and effects) → **No music** → **Muted**. The choice is remembered in localStorage.
 
@@ -116,7 +116,29 @@ The music is composed at run time as a 4-bar loop for each biome. Each biome has
   - Before the start, only the pad and a soft lead play.
   - A new biome restarts the loop in its own style.
   - On a crash or finish, the music fades out.
-- **Scheduling**: notes are queued about 0.2 s ahead on the audio clock from the render loop, so frame drops don't change the timing.
+- **Scheduling**: notes are queued about 0.3 s ahead on the audio clock. A 50 ms timer tops the queue up as well as the render loop, so slow or throttled frames cause no gaps.
+- **Levels**: master 0.9, then a compressor; music bus 0.9. Measured during a run, music averages about −29 dB RMS against about −25 dB for the whole mix. Before this it was about −41 dB under a −32 dB mix, which is why it could not be heard.
+
+## Endless mode
+
+Open it with **Play endless** under the track preview. There is no finish line; one crash ends the run.
+
+- **Track** (`src/shared/endless.ts`): normal generated 450-row legs joined end to end. Each leg has three fresh biomes, never the same biome twice in a row, and its finish row turned into plain ground. A leg starts with 16 empty rows, so the runner can cross over from wherever the last safe line ended.
+- **Difficulty**: every leg adds 2 % obstacle density, up to +25 % from leg 13 on.
+- **Same for everyone**: the endless track is fixed per date.
+- **Generated on demand**: the track is kept 200 rows ahead of the runner (`keepAhead`). Smashed and collected cells far behind are forgotten, because the autopilot copies them for every line it tries and long runs got slower and slower.
+- **Local only**: endless runs don't go to the server or the leaderboard. The best distance per date is stored in the browser. The HUD shows distance in metres and no par; the result card shows distance, time and today's best.
+- **How far the autopilot gets**: `npm run autotest -- --endless --days 5 --max-legs 200`. Every leg keeps a guaranteed open lane and the autopilot looks 22 rows ahead, so it almost never crashes. Over 5 days with a 200-leg cap, 4 runs reached the cap: 90,000 rows, 180 km, about 88.5 min of play. One crashed in leg 155 (139 km, 68:44) on a Jungle crash cell with the ox cart, at the maximum +25 % density. Simulating a 200-leg run takes about 80 s.
+
+## Timed vehicles last longer
+
+- Every timed vehicle lasts 3× its listed length (`TIMED_LENGTH` in `src/shared/vehicles.ts`):
+  - most vehicles: 30 rows
+  - Helicopter, Balloon and Subway: 24 rows
+  - Zipline and Rocket: 18 rows
+- 30 rows is about 2 s at cruise speed. Before, it was 6–10 rows, well under a second.
+- The generator plans each segment's two pickup windows together. A wall that would fall inside a window is skipped, so both longer windows always fit.
+- The tests read each length from the data instead of hard-coding it.
 
 ## Layout (spec §16)
 
@@ -162,6 +184,8 @@ devvit/                 devvit.json + the Devvit server entry, parked until the 
   - Open it with the ❚❚ button on the track, or the P or Esc key. Leaving the page also pauses: switching tabs or apps, opening devtools, or a phone call.
   - While paused, the sim stops, the sound fades, and the track is hidden behind a 90 % overlay, so a pause is not free time to study the road ahead.
   - Resume with the button, P, Esc or Space.
+  - **View track** during a run pauses it and keeps it: the run screen stays mounted but hidden, ignores keys and draws nothing. The preview button reads "Back to the run (paused)".
+- **Sound on phones.** Audio unlocks on pointerup, touchend and click as well as pointerdown and keydown. On a touch screen a finger going down is not a user gesture, so without this the first tap was silent.
 - **Loading hint.** Atlas pages are fetched with byte-level progress.
   - Before the first biome is in, the Start button reads "Loading Space 45%".
   - After 10 s the run can start anyway: missing sprites are baked on the fly.

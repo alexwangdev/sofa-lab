@@ -5,10 +5,10 @@
  * - The lead melody is generated from the day's seed, so each biome has its own tune that day (same for everyone).
  * - Layers: pad (held chord), bass, lead, arpeggio, chip drums. Speed raises the tempo (−15 % … +25 %) and adds
  *   layers: arpeggios past half speed, an extra drum level near top speed.
- * - Notes are scheduled ~0.2 s ahead on the AudioContext clock from the render loop (`musicFrame`), so timing does not
- *   depend on frame rate. The music bus sits under the sound effects and follows the Sound / No music / Muted mode.
+ * - Notes are scheduled ~0.3 s ahead on the AudioContext clock, topped up by a 50 ms timer as well as by the render loop
+ *   (`musicFrame`), so timing does not depend on frame rate. The music bus sits under the sound effects and follows the Sound / No music / Muted mode.
  */
-import { segmentOf } from '../shared/grid.ts';
+import { SEG_ROWS, biomeAt, segmentOf } from '../shared/grid.ts';
 import { hash3, mulberry32 } from '../shared/rng.ts';
 import type { RunState } from '../shared/sim.ts';
 import type { BiomeId } from '../shared/types.ts';
@@ -54,8 +54,11 @@ const STYLES: Record<BiomeId, Style> = {
   space: { bpm: 72, root: 60, scale: [0, 2, 4, 6, 8, 10], prog: [0, 1, 0, 2], lead: 'bell', bass: 'sine', pad: 'sine', drums: 0, density: 0.25, arp: false },
 };
 
-const MUSIC = 0.3;
-const AHEAD = 0.2;
+/** Music bus level: measured to sit about level with the ride sound and effects (it was ~9 dB under them at 0.3). */
+const MUSIC = 0.9;
+/** Notes are queued this far ahead; a 50 ms timer tops the queue up, so slow or throttled frames do not cause gaps. */
+const AHEAD = 0.3;
+const PUMP_MS = 50;
 const BARS = 4;
 const STEPS = 16;
 
@@ -178,7 +181,7 @@ export function musicFrame(s: RunState, dt: number): void {
   const seg = segmentOf(s.row);
   if (play.run !== s || !play.playing || seg !== play.seg) {
     // new run, restart, or a new biome: start its tune from the top of the loop
-    const biome = s.course.biomes[seg];
+    const biome = biomeAt(s.course, s.row);
     play.tune = compose(STYLES[biome], hash3(s.course.seed, seg, 0x6d75));
     play.run = s;
     play.seg = seg;
@@ -186,10 +189,21 @@ export function musicFrame(s: RunState, dt: number): void {
     if (!play.playing) play.next = c.currentTime + 0.05;
     play.playing = true;
   }
-  const st = STYLES[s.course.biomes[seg]];
   const target = s.phase === 'run' ? Math.max(0, Math.min(1, (s.speed - 3) / 14)) : 0;
   play.sp += (target - play.sp) * Math.min(1, dt * 1.5);
-  // a stalled frame (or a long-hidden tab) must not dump a burst of late notes
+  pump();
+  pumpTimer ??= window.setInterval(pump, PUMP_MS);
+}
+
+let pumpTimer: number | null = null;
+/** Queue notes up to AHEAD seconds past now for the run musicFrame last saw. */
+function pump(): void {
+  const a = audioOut();
+  const s = play.run;
+  if (!a || !bus || !s || !play.playing) return;
+  const { c } = a;
+  const st = STYLES[biomeAt(s.course, play.seg * SEG_ROWS)];
+  // a long stall (or a hidden tab) must not dump a burst of late notes
   if (play.next < c.currentTime - 0.05) play.next = c.currentTime + 0.02;
   const calm = s.phase !== 'run';
   while (play.next < c.currentTime + AHEAD) {

@@ -8,10 +8,13 @@
  *   npm run autotest -- --all-routes                   all 336 biome routes (8 × 7 × 6), one track each
  *   npm run autotest -- --grab                         go out of the way for pickups (drives every vehicle)
  *   npm run autotest -- --cruise                       no Tuck
+ *   npm run autotest -- --endless [--days 10] [--max-legs 60]
+ *                                                      endless mode: how far the autopilot gets before it crashes
  */
 import { decide, makePilot } from '../src/shared/autopilot.ts';
 import { dailyRoute, dailySeed, generateCourse } from '../src/shared/course.ts';
-import { FINISH_ROW, cellAt, segmentOf } from '../src/shared/grid.ts';
+import { FINISH_ROW, ROWS, biomeAt, cellAt } from '../src/shared/grid.ts';
+import { LEG_DENSITY, MAX_EXTRA, keepAhead, newEndless } from '../src/shared/endless.ts';
 import { utcDate } from '../src/shared/rng.ts';
 import { IN, MAX_TICKS, computePar, newRun, replay, score, startRun, tick, vehicleFor } from '../src/shared/sim.ts';
 import { BIOMES } from '../src/shared/biomes.ts';
@@ -52,6 +55,39 @@ const quiet = jobs.length > 60 && !flag('verbose');
 type Row = { date: string; route: string; ok: boolean; time: number; total: number; timeScore: number; gates: string; pickups: string[]; why: string; ms: number };
 const rows: Row[] = [];
 const par = computePar();
+
+// ---------- endless: run each day's endless track until the autopilot crashes (or --max-legs) ----------
+if (flag('endless')) {
+  const days = Number(arg('days', '10')) || 10;
+  const maxLegs = Number(arg('max-legs', '60')) || 60;
+  const out: { date: string; row: number; legs: number; time: number; why: string; ms: number }[] = [];
+  for (let d = 0; d < days; d++) {
+    const date = addDays(from, d);
+    const course = newEndless(date);
+    const s = newRun(course, par);
+    startRun(s);
+    const t0 = performance.now();
+    while (s.phase === 'run' && s.row < maxLegs * ROWS) {
+      keepAhead(s);
+      tick(s, s.tick === 0 && fast ? [IN.fastOn] : [], pilot);
+      s.events.length = 0;
+    }
+    const leg = Math.floor(s.row / ROWS);
+    let why = 'reached --max-legs';
+    if (s.phase === 'crash') {
+      const k = cellAt(course, s.row, s.lane);
+      why = `${CELL_NAMES[k] ?? k} in ${BIOMES[biomeAt(course, s.row)].name} (${vehicleFor(s, s.row).name}), leg ${leg + 1} at +${Math.round(Math.min(MAX_EXTRA, leg * LEG_DENSITY) * 100)} % density`;
+    }
+    out.push({ date, row: s.row, legs: s.row / ROWS, time: s.time, why, ms: performance.now() - t0 });
+    const mm = (t: number) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
+    console.log(`${date}  ${String(s.row).padStart(6)} rows (${(s.row * 2 / 1000).toFixed(1)} km, ${(s.row / ROWS).toFixed(1)} legs)  ${mm(s.time)} play  ·  ${why}  ·  ${(out.at(-1)!.ms / 1000).toFixed(1)} s to simulate`);
+  }
+  const sorted = out.map((o) => o.row).sort((a, b) => a - b);
+  const capped = out.filter((o) => o.why === 'reached --max-legs').length;
+  console.log(`
+endless: median ${sorted[Math.floor(sorted.length / 2)]} rows · min ${sorted[0]} · max ${sorted.at(-1)} · ${capped}/${out.length} reached the ${maxLegs}-leg cap`);
+  process.exit(0);
+}
 // coverage
 const byPos: Record<string, [number, number]> = {}; // "biome@seg" → [runs, finished]
 const veh: Record<string, { offered: number; taken: number; rowsDriven: number; crashedIn: number }> = {};
@@ -92,7 +128,7 @@ for (const job of jobs) {
   let why = '';
   if (s.phase === 'crash') {
     const k = cellAt(course, s.row, s.lane);
-    const b = BIOMES[course.biomes[segmentOf(s.row)]];
+    const b = BIOMES[biomeAt(course, s.row)];
     const driving = vehicleFor(s, s.row);
     if (!driving.base) {
       const v = veh[driving.id];

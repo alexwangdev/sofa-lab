@@ -7,7 +7,7 @@
  */
 import { BIOMES } from '../shared/biomes.ts';
 import type { Palette } from '../shared/biomes.ts';
-import { BOUNDARIES, COLS, FINISH_ROW, segmentOf } from '../shared/grid.ts';
+import { COLS, biomeAt, finishRow, nextBoundary, segmentOf } from '../shared/grid.ts';
 import { hash3 } from '../shared/rng.ts';
 import { AIR_ROWS, cellFor, nextRow, vehicleFor } from '../shared/sim.ts';
 import type { RunState } from '../shared/sim.ts';
@@ -52,13 +52,11 @@ const css = (c: RGB, k = 1, fog?: RGB, f = 0): string => {
 
 /** Palette blend at a row: last FADE_ROWS rows before a boundary crossfade into the next biome. */
 function blendAt(course: Course, row: number): { a: Palette; b: Palette; t: number } {
-  const seg = segmentOf(row);
-  const a = BIOMES[course.biomes[seg]].palette;
-  for (const bd of BOUNDARIES) {
-    if (row >= bd - FADE_ROWS && row < bd) {
-      const nb = BIOMES[course.biomes[segmentOf(bd)]].palette;
-      return { a, b: nb, t: (row - (bd - FADE_ROWS) + 1) / (FADE_ROWS + 1) };
-    }
+  const a = BIOMES[biomeAt(course, row)].palette;
+  const bd = nextBoundary(course, row);
+  if (bd !== null && row >= bd - FADE_ROWS) {
+    const nb = BIOMES[biomeAt(course, bd)].palette;
+    return { a, b: nb, t: (row - (bd - FADE_ROWS) + 1) / (FADE_ROWS + 1) };
   }
   return { a, b: a, t: 0 };
 }
@@ -155,7 +153,7 @@ function drawSky(ctx: CanvasRenderingContext2D, c: Cam, s: RunState): void {
   g.addColorStop(1, css(pick(bl, (p) => p.sky[2])));
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, c.w, c.hy + 1);
-  if (s.course.biomes[segmentOf(Math.floor(s.pos))] === 'space') {
+  if (biomeAt(s.course, Math.floor(s.pos)) === 'space') {
     ctx.fillStyle = 'rgba(255,255,255,0.8)';
     for (let i = 0; i < 40; i++) ctx.fillRect(hash3(i, 1, 7) * c.w, hash3(i, 2, 7) * c.hy * 0.9, 1.5, 1.5);
   }
@@ -394,7 +392,7 @@ function rowColors(course: Course, r: number): RowColors {
       side: pick(bl, (p) => p.side[0]),
       gate: mixRGB(g0, pick(bl, (p) => two(p.gate, course.gateRows.get(r) ?? 0)), 0.35),
       fast: mixRGB(pick(bl, (p) => p.fast), [34, 211, 238], 0.55),
-      slow: mixRGB(g0, rgb(BIOMES[course.biomes[segmentOf(r)]].palette.slow), 0.45),
+      slow: mixRGB(g0, rgb(BIOMES[biomeAt(course, r)].palette.slow), 0.45),
       hazard: mixRGB(g0, HAZARD, 0.32),
       lineCss: alphas(line, 0.45),
       edgeCss: alphas(edge, 0.6),
@@ -478,7 +476,7 @@ function drawRowObjects(ctx: CanvasRenderingContext2D, c: Cam, s: RunState, fx: 
   if (r - c.z < NEAR) return;
   const course = s.course;
   const g = heightAt(course, r + 0.5);
-  const biome = course.biomes[segmentOf(r)];
+  const biome = biomeAt(course, r);
   const pal = BIOMES[biome].palette;
   const cellPx = c.F / (r + 0.5 - c.z);
   if (cellPx < 2.5) return; // too far to see anything
@@ -532,7 +530,7 @@ function drawRowObjects(ctx: CanvasRenderingContext2D, c: Cam, s: RunState, fx: 
       }
     }
   }
-  if (r === FINISH_ROW) {
+  if (!course.endless && r === finishRow(course)) {
     box(ctx, c, -0.6, -0.3, g, g + 2.6, r, r + 0.3, '#334155');
     box(ctx, c, COLS + 0.3, COLS + 0.6, g, g + 2.6, r, r + 0.3, '#334155');
     box(ctx, c, -0.6, COLS + 0.6, g + 2.0, g + 2.6, r, r + 0.15, '#ea580c');
@@ -643,8 +641,9 @@ function drawOverlays(ctx: CanvasRenderingContext2D, c: Cam, s: RunState, fx: Fx
 /* ---------- streaming: preload the biome ahead, drop what is behind ---------- */
 
 /** Bring a segment's sprites in: the build-time atlas if there is one, otherwise bake the same catalog in idle time. */
-function preloadSegment(course: Course, seg: 0 | 1 | 2): void {
+function preloadSegment(course: Course, seg: number): void {
   const biome = course.biomes[seg];
+  if (!biome) return;
   void loadBiomeAtlas(biome).then((ok) => {
     if (!ok) for (const item of biomeCatalog(biome)) preloadViews(item.entry, item.views);
   });
@@ -669,11 +668,14 @@ function streamTick(course: Course, row: number): void {
   const seg = segmentOf(row);
   if (seg !== st.seg) {
     st.seg = seg;
-    const passed = new Set<string>(course.biomes.slice(0, seg));
+    // biomes behind that are not this one or the next (an endless track can bring a biome back later: then it is
+    // simply fetched again, from the HTTP cache)
+    const keep = new Set<string>([course.biomes[seg], course.biomes[seg + 1]].filter((b) => b !== undefined));
+    const passed = new Set<string>(course.biomes.slice(0, seg).filter((b) => !keep.has(b)));
     evict((tag) => passed.has(tag)); // the road behind is gone: its sprites and fog tints are freed
     for (const b of passed) forgetBiomeAtlas(b as BiomeId);
     preloadSegment(course, seg);
-    if (seg < 2) preloadSegment(course, (seg + 1) as 1 | 2);
+    preloadSegment(course, seg + 1);
   }
   if (st.frame % 120 === 0) {
     evict((tag, idle) => (tag === 'shared' || tag === 'vehicle') && idle > 20_000);
@@ -718,7 +720,7 @@ export function drawFrame(ctx: CanvasRenderingContext2D, s: RunState, fx: Fx, w:
   const c = makeCamera(s, fx, w, h);
   if (renderLayers.sky) drawSkyCached(ctx, c, s);
   const rStart = Math.floor(c.z + NEAR) - 1;
-  const rEnd = Math.min(FINISH_ROW + 6, Math.floor(c.z + far));
+  const rEnd = Math.min(finishRow(s.course) + (s.course.endless ? 0 : 6), Math.floor(c.z + far));
   const runnerRow = Math.floor(s.pos - 0.6);
   drawGround(ctx, c, s, fx, rStart, rEnd);
   let fogged = false;

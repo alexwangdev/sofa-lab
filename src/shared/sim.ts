@@ -7,7 +7,7 @@
  * same result in every JS engine.
  */
 import { BIOMES } from './biomes.ts';
-import { COLS, FINISH_ROW, cellAt, cellKey, segmentOf } from './grid.ts';
+import { COLS, FINISH_ROW, biomeAt, cellAt, cellKey, finishRow, segmentOf } from './grid.ts';
 import { vehicle } from './vehicles.ts';
 import { Cell } from './types.ts';
 import type { Course, Phase, ScoreParts, VehicleDef, VehicleId } from './types.ts';
@@ -115,7 +115,7 @@ function pickupAt(course: Course, row: number, lane: number): VehicleId | undefi
   return course.pickups.find((p) => p.row === row && p.lane === lane)?.vehicle;
 }
 
-const baseVehicleAt = (course: Course, row: number): VehicleDef => vehicle(BIOMES[course.biomes[segmentOf(row)]].base);
+const baseVehicleAt = (course: Course, row: number): VehicleDef => vehicle(BIOMES[biomeAt(course, row)].base);
 
 /** The vehicle in charge when entering `row`. */
 export function vehicleFor(s: RunState, row: number): VehicleDef {
@@ -138,7 +138,7 @@ export function cellFor(s: RunState, row: number, lane: number): number {
 export function nextRow(s: RunState): number {
   const v = vehicleFor(s, s.row);
   const step = s.row < s.timedUntil && s.timed !== null ? 1 + v.jumpRows : 1;
-  return Math.min(FINISH_ROW, s.row + step);
+  return Math.min(finishRow(s.course), s.row + step);
 }
 
 /** Largest lane change allowed when entering `row` (0 also means queued input is dropped). */
@@ -203,7 +203,7 @@ export function enterRow(s: RunState, row: number, request: number): void {
   s.lane = from + delta;
   s.lastMove = delta;
 
-  if (row >= FINISH_ROW) {
+  if (!s.course.endless && row >= finishRow(s.course)) {
     finish(s);
     return;
   }

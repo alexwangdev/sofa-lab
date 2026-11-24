@@ -32,7 +32,9 @@ const PICKUP_GAP = 5;
 /** Walls with a gap, second half only, every 70 rows. */
 const WALLS: readonly number[] = Array.from({ length: Math.max(0, Math.floor((FINISH_ROW - 10 - (Math.floor(ROWS / 2) + 15)) / 70) + 1) }, (_, i) => Math.floor(ROWS / 2) + 15 + i * 70);
 
-export function generateCourse(date: string, biomes: readonly [BiomeId, BiomeId, BiomeId] = dailyRoute(dailySeed(date))): Course {
+/** extraDensity: added to the obstacle density of every row (endless legs get harder; the daily track uses 0). */
+export function generateCourse(date: string, biomes: readonly [BiomeId, BiomeId, BiomeId] = dailyRoute(dailySeed(date)), opts: { extraDensity?: number } = {}): Course {
+  const extra = opts.extraDensity ?? 0;
   const seed = dailySeed(date);
   // the route draws from mulberry32(seed); the track uses its own stream so both stay stable
   const rng = mulberry32(hashSeed(`gridexpedition:${date}:track`));
@@ -44,21 +46,23 @@ export function generateCourse(date: string, biomes: readonly [BiomeId, BiomeId,
   const int = (lo: number, hi: number) => lo + Math.floor(rng() * (hi - lo + 1));
 
   // 0. plan the pickups first (2 per segment): their windows lock the safe line and stay free of gates/ramps/walls
+  //    (a wall that would fall inside a window is skipped, see 3)
   const plan: { row: number; vehicle: string; segment: 0 | 1 | 2; lo: number; hi: number }[] = [];
   for (const seg of [0, 1, 2] as const) {
     const list = timedFor(biomes[seg]);
-    for (let n = 0; n < 2; n++) {
-      const v = list[Math.floor(rng() * list.length)] ?? list[0];
-      if (!v) continue;
-      const first = SEGMENT_START[seg] + BOUNDARY_GAP + 14;
-      const last = segmentEnd(seg) - BOUNDARY_GAP - v.durationRows - 8;
-      for (let attempt = 0; attempt < 200; attempt++) {
-        const P = int(first, last);
+    const picks = [0, 1].map(() => list[Math.floor(rng() * list.length)] ?? list[0]).filter((v) => v !== undefined);
+    // place the segment's two windows together (retrying both), so a badly placed first one cannot crowd out the second
+    for (let attempt = 0; attempt < 400; attempt++) {
+      const got: typeof plan = [];
+      for (const v of picks) {
+        const P = int(SEGMENT_START[seg] + BOUNDARY_GAP + 14, segmentEnd(seg) - BOUNDARY_GAP - v.durationRows - 8);
         const lo = P - 14;
         const hi = P + v.durationRows + 8;
-        if (plan.some((p) => Math.abs(p.row - P) < Math.max(PICKUP_GAP, 20) || (lo <= p.hi && hi >= p.lo))) continue;
-        if (WALLS.some((w) => w >= lo && w <= hi)) continue;
-        plan.push({ row: P, vehicle: v.id, segment: seg, lo, hi });
+        if ([...plan, ...got].some((p) => Math.abs(p.row - P) < Math.max(PICKUP_GAP, 20) || (lo <= p.hi && hi >= p.lo))) break;
+        got.push({ row: P, vehicle: v.id, segment: seg, lo, hi });
+      }
+      if (got.length === picks.length) {
+        plan.push(...got);
         break;
       }
     }
@@ -81,19 +85,19 @@ export function generateCourse(date: string, biomes: readonly [BiomeId, BiomeId,
 
   // 2. obstacles 5% → 20% over the whole run, plus Slow cells
   for (let r = 16; r < FINISH_ROW - 2; r++) {
-    const density = 0.05 + 0.15 * (r / FINISH_ROW);
+    const density = 0.05 + 0.15 * (r / FINISH_ROW) + extra;
     for (let c = 0; c < COLS; c++) {
       const x = rng();
       if (x < density) set(r, c, Cell.Crash);
       else if (x < density + 0.014) set(r, c, Cell.Slow);
     }
   }
-  // 3. walls with a gap in the second half
+  // 3. walls with a gap in the second half (none inside a pickup window)
   for (const r of WALLS) {
+    if (inWindow(r)) continue;
     const gap = safeAt(r);
-    const wide = r < 520;
     for (let c = 0; c < COLS; c++) {
-      const open = c === gap || (wide && c === gap + (gap < COLS - 1 ? 1 : -1));
+      const open = c === gap || c === gap + (gap < COLS - 1 ? 1 : -1);
       if (!open) set(r, c, Cell.Crash);
     }
   }

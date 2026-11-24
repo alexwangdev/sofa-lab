@@ -4,7 +4,7 @@
  */
 import { useEffect, useRef } from 'react';
 import { BIOMES } from '../shared/biomes.ts';
-import { BOUNDARIES, COLS, FINISH_ROW, SEGMENT_START, segmentEnd, segmentOf } from '../shared/grid.ts';
+import { BOUNDARIES, COLS, FINISH_ROW, SEGMENT_START, biomeAt, segmentEnd } from '../shared/grid.ts';
 import { vehicle } from '../shared/vehicles.ts';
 import { Cell } from '../shared/types.ts';
 import type { Course } from '../shared/types.ts';
@@ -12,7 +12,7 @@ import { effectText, vehicleModel } from './models.ts';
 import { BiomeLegend, Thumb } from './Gallery.tsx';
 
 function cellColor(course: Course, row: number, col: number): string {
-  const pal = BIOMES[course.biomes[segmentOf(row)]].palette;
+  const pal = BIOMES[biomeAt(course, row)].palette;
   const k = course.cells[row * COLS + col] ?? 0;
   switch (k) {
     case Cell.Crash:

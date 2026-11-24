@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { PointerEvent as RPointerEvent, ReactNode } from 'react';
 import { BIOMES } from '../shared/biomes.ts';
 import { generateCourse } from '../shared/course.ts';
-import { BOUNDARIES, ROWS, segmentOf } from '../shared/grid.ts';
+import { ROWS, biomeAt, nextBoundary, segmentOf } from '../shared/grid.ts';
 import { METERS_PER_ROW, canControlSpeed, score } from '../shared/sim.ts';
 import type { RunState } from '../shared/sim.ts';
 import { vehicle } from '../shared/vehicles.ts';
@@ -13,6 +13,7 @@ import { ExpeditionCanvas } from './ExpeditionCanvas.tsx';
 import type { CanvasHandle } from './ExpeditionCanvas.tsx';
 import { MiniMap, TrackPreview } from './TrackPreview.tsx';
 import { prewarmCourse } from './render.ts';
+import { newEndless } from '../shared/endless.ts';
 import { atlasLoading, readyToStart } from './atlas.ts';
 import { DevToolbar } from './DevToolbar.tsx';
 import { Gallery } from './Gallery.tsx';
@@ -61,12 +62,34 @@ function loadingOf(s: RunState, next: number | undefined): Hud['loading'] {
   const seg = segmentOf(s.row);
   const segs = next !== undefined && next - s.row < LOADING_AHEAD ? [seg, seg + 1] : [seg];
   for (const i of segs) {
-    const b = s.course.biomes[i as 0 | 1 | 2];
+    const b = s.course.biomes[i];
+    if (!b) continue;
     const f = atlasLoading(b);
     if (f !== null) return { name: BIOMES[b].name, pct: Math.round(f * 100) };
   }
   return null;
 }
+const ENDLESS_KEY = 'grid-expedition:endless-best';
+/** Best endless distance (rows) per date, kept in this browser only. */
+function endlessBest(date: string): number {
+  try {
+    return (JSON.parse(localStorage.getItem(ENDLESS_KEY) ?? '{}') as Record<string, number>)[date] ?? 0;
+  } catch {
+    return 0;
+  }
+}
+function saveEndlessBest(date: string, rows: number): boolean {
+  if (rows <= endlessBest(date)) return false;
+  try {
+    const all = JSON.parse(localStorage.getItem(ENDLESS_KEY) ?? '{}') as Record<string, number>;
+    all[date] = rows;
+    localStorage.setItem(ENDLESS_KEY, JSON.stringify(all));
+  } catch {
+    /* storage full / private mode */
+  }
+  return true;
+}
+
 type Result = {
   phase: 'crash' | 'finish';
   parts: ScoreParts;
@@ -75,12 +98,14 @@ type Result = {
   time: number;
   server: RunResponse | null;
   error: string | null;
+  /** Endless runs: best distance (rows) today in this browser, and whether this run set it. */
+  endless?: { best: number; improved: boolean };
 };
 
 const route = (t: TodayResponse) => t.biomes.map((b) => BIOMES[b].name).join(' → ');
 
 function hudOf(s: RunState): Hud {
-  const next = BOUNDARIES.find((b) => b > s.row);
+  const next = nextBoundary(s.course, s.row) ?? undefined;
   return {
     score: score(s).total,
     row: s.row,
@@ -93,7 +118,8 @@ function hudOf(s: RunState): Hud {
     canSpeed: canControlSpeed(s),
     taken: s.taken,
     loading: loadingOf(s, next),
-    canStart: readyToStart(s.course.biomes[0]),
+    // only before the start: during a run the passed biome's atlas is dropped on purpose and must not be fetched again
+    canStart: s.phase === 'ready' && readyToStart(biomeAt(s.course, 0)),
   };
 }
 
@@ -101,6 +127,7 @@ export function App() {
   const [today, setToday] = useState<TodayResponse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [screen, setScreen] = useState<'preview' | 'run' | 'gallery'>('preview');
+  const [mode, setMode] = useState<'daily' | 'endless'>('daily');
   const [run, setRun] = useState({ key: 0, auto: false });
   const [hud, setHud] = useState<Hud | null>(null);
   const [result, setResult] = useState<Result | null>(null);
@@ -127,8 +154,17 @@ export function App() {
   const course = useMemo(() => {
     if (!routeKey) return null;
     const [date = "", ids = ""] = routeKey.split("|");
+    // endless: the day's endless track (same for everyone that date), grown as the run goes
+    if (mode === 'endless') return newEndless(date);
     return generateCourse(date, ids.split(",") as TodayResponse["biomes"]);
-  }, [routeKey]);
+  }, [routeKey, mode]);
+  const endless = mode === 'endless';
+  const playMode = (m: 'daily' | 'endless') => {
+    setMode(m);
+    setResult(null);
+    setRun((r) => ({ key: r.key + 1, auto: false }));
+    setScreen(m === 'endless' ? 'run' : 'preview');
+  };
 
   // start baking the first two biomes in idle time as soon as the day is known (while the preview is open)
   useEffect(() => {
@@ -141,6 +177,12 @@ export function App() {
       if (!today || !course) return;
       const parts = score(s);
       const base: Result = { phase: s.phase === 'finish' ? 'finish' : 'crash', parts, distance: s.row, gates: s.gates, time: s.time, server: null, error: null };
+      if (course.endless) {
+        // local only: no server, no leaderboard
+        const improved = saveEndlessBest(today.date, s.row);
+        setResult({ ...base, endless: { best: endlessBest(today.date), improved } });
+        return;
+      }
       setResult(base);
       setShared('idle');
       // the server replays s.log and scores the run itself; the claimed score must match its replay
@@ -192,9 +234,21 @@ export function App() {
         {today && screen === 'run' && (
           <div className="flex gap-2 shrink-0">
             <SoundToggle />
-            <button className="btn btn-secondary" onClick={() => setScreen('preview')}>
-              View track
-            </button>
+            {endless ? (
+              <button className="btn btn-secondary" onClick={() => playMode('daily')}>
+                Exit endless
+              </button>
+            ) : (
+              <button
+                className="btn btn-secondary"
+                onClick={() => {
+                  canvas.current?.setPaused(true);
+                  setScreen('preview');
+                }}
+              >
+                View track
+              </button>
+            )}
           </div>
         )}
       </header>
@@ -212,19 +266,33 @@ export function App() {
 
       {today && course && screen === 'preview' && (
         <main className="w-full max-w-[480px]">
-          <TrackPreview course={course} startLabel={today.playedToday ? 'Back to the run' : 'Start run'} onStart={() => setScreen('run')} />
+          <TrackPreview course={course} startLabel={hud?.phase === 'run' ? 'Back to the run (paused)' : today.playedToday ? 'Back to the run' : 'Start run'} onStart={() => setScreen('run')} />
+          <section className="mt-3 rounded-xl bg-slate-800/70 p-3 flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="font-bold">Endless</p>
+              <p className="text-xs text-slate-400">No finish line. Every 450 rows brings three new biomes and more obstacles. Best today: {endlessBest(today.date) * METERS_PER_ROW} m</p>
+            </div>
+            <button className="btn btn-secondary shrink-0" onClick={() => playMode('endless')}>
+              Play endless
+            </button>
+          </section>
         </main>
       )}
 
-      {today && course && screen === 'run' && (
-        <>
-          <HudBar hud={hud} />
+      {/* the run stays mounted while the preview or gallery is open (hidden), so viewing the track never loses a run */}
+      {today && course && (
+        <div className={screen === 'run' ? 'contents' : 'hidden'}>
+          <HudBar hud={hud} endless={endless} />
           <main className="relative w-full max-w-[480px]">
-            <ExpeditionCanvas key={run.key} ref={canvas} course={course} parSeconds={today.parSeconds} autoStart={run.auto} autoPilot={autoPilot} onTick={onTick} onEnd={onEnd} onRetry={retry} />
+            <ExpeditionCanvas key={run.key} ref={canvas} active={screen === 'run'} course={course} parSeconds={today.parSeconds} autoStart={run.auto} autoPilot={autoPilot} onTick={onTick} onEnd={onEnd} onRetry={retry} />
             {hud?.phase === 'ready' && !result && (
               <Overlay>
-                <p className="text-xl font-extrabold">{BIOMES[today.biomes[0]].name} first</p>
-                <p className="text-sm text-slate-300 text-center max-w-64">One lane per row. Crash cells end the run. Finish faster for a bigger time score (only if you reach the finish). Grab pickups to change how you move.</p>
+                <p className="text-xl font-extrabold">{endless ? 'Endless: how far can you go?' : `${BIOMES[today.biomes[0]].name} first`}</p>
+                <p className="text-sm text-slate-300 text-center max-w-64">
+                  {endless
+                    ? 'No finish line. Every 450 rows: three new biomes and more obstacles. One crash ends the run.'
+                    : 'One lane per row. Crash cells end the run. Finish faster for a bigger time score (only if you reach the finish). Grab pickups to change how you move.'}
+                </p>
                 <button className="btn btn-primary text-base px-6" disabled={!hud.canStart} onClick={() => canvas.current?.start()}>
                   {hud.canStart ? 'Start' : `Loading ${hud.loading?.name ?? ''} ${hud.loading?.pct ?? 0}%`}
                 </button>
@@ -236,20 +304,20 @@ export function App() {
                 Loading {hud.loading.name} · {hud.loading.pct}%
               </p>
             )}
-            {result && (
-              <ResultCard result={result} today={today} board={board} shared={shared} onShare={share} onRetry={retry} />
-            )}
+            {result && (result.endless ? <EndlessResult result={result} onRetry={retry} /> : <ResultCard result={result} today={today} board={board} shared={shared} onShare={share} onRetry={retry} />)}
           </main>
-          <div className="w-full max-w-[480px]">
-            <MiniMap course={course} pos={hud?.row ?? 0} taken={hud?.taken ?? new Set()} />
-          </div>
+          {!endless && (
+            <div className="w-full max-w-[480px]">
+              <MiniMap course={course} pos={hud?.row ?? 0} taken={hud?.taken ?? new Set()} />
+            </div>
+          )}
           <nav className="w-full max-w-[480px] grid grid-cols-4 gap-2" aria-label="Controls">
             <Pad label="◀" title="Lane left" onPress={() => canvas.current?.steer(-1)} repeat />
             <Pad label="Brake" title="Brake (hold)" disabled={hud ? !hud.canSpeed : false} onHold={(on) => canvas.current?.hold('brake', on)} />
             <Pad label="Tuck" title="Tuck for speed (hold)" disabled={hud ? !hud.canSpeed : false} onHold={(on) => canvas.current?.hold('fast', on)} />
             <Pad label="▶" title="Lane right" onPress={() => canvas.current?.steer(1)} repeat />
           </nav>
-        </>
+        </div>
       )}
       {/* standalone test build: the test toolbar is always on (remove it in the Devvit build) */}
       {screen === 'gallery' && <Gallery onClose={() => setScreen('preview')} />}
@@ -266,17 +334,17 @@ export function App() {
   );
 }
 
-function HudBar({ hud }: { hud: Hud | null }) {
+function HudBar({ hud, endless }: { hud: Hud | null; endless: boolean }) {
   const cell = 'rounded-md bg-slate-800 px-1.5 py-1 leading-tight min-w-0';
-  // elapsed time; turns amber once you are slower than par (the time score is 3000 × par / time)
-  const slow = hud !== null && hud.time > hud.par;
+  // elapsed time; turns amber once you are slower than par (the time score is 3000 × par / time). Endless: no par.
+  const slow = !endless && hud !== null && hud.time > hud.par;
   return (
     <div className="w-full max-w-[480px] grid grid-cols-4 gap-1.5 text-center text-xs tabular-nums" aria-live="off">
       <div className={cell}>
         <p className="text-slate-400">Time</p>
         <p className={`text-base font-bold ${slow ? 'text-amber-400' : ''}`} title="Finish faster than par for more than 3000 time points">
           {(hud?.time ?? 0).toFixed(1)}
-          <span className="text-slate-400 text-xs">/{Math.round(hud?.par ?? 0)}</span>
+          {!endless && <span className="text-slate-400 text-xs">/{Math.round(hud?.par ?? 0)}</span>}
         </p>
       </div>
       <div className={cell}>
@@ -286,8 +354,8 @@ function HudBar({ hud }: { hud: Hud | null }) {
       <div className={cell}>
         <p className="text-slate-400">Distance</p>
         <p className="text-base font-bold">
-          {hud?.row ?? 0}
-          <span className="text-slate-400 text-xs">/{ROWS}</span>
+          {endless ? `${(hud?.row ?? 0) * METERS_PER_ROW} m` : (hud?.row ?? 0)}
+          {!endless && <span className="text-slate-400 text-xs">/{ROWS}</span>}
         </p>
       </div>
       <div className={cell}>
@@ -325,6 +393,27 @@ function Overlay({ children }: { children: ReactNode }) {
         {children}
       </div>
     </div>
+  );
+}
+
+function EndlessResult({ result: r, onRetry }: { result: Result; onRetry: () => void }) {
+  const best = r.endless?.best ?? 0;
+  return (
+    <Overlay>
+      <p className="text-2xl font-extrabold text-red-400">Crashed</p>
+      <p className="text-4xl font-black tabular-nums -mt-1">{r.distance * METERS_PER_ROW} m</p>
+      <p className="text-sm text-slate-300 tabular-nums">
+        {r.distance} rows · {Math.floor(r.time / 60)}:{String(Math.floor(r.time % 60)).padStart(2, '0')} · {r.parts.total} points
+      </p>
+      <p className="text-xs text-slate-300">
+        Best today <b>{best * METERS_PER_ROW} m</b>
+        {r.endless?.improved && <span className="text-orange-400"> · new best</span>}
+      </p>
+      <p className="text-xs text-slate-500">Endless runs stay on this device (no leaderboard).</p>
+      <button className="btn btn-primary px-5" onClick={onRetry}>
+        Retry
+      </button>
+    </Overlay>
   );
 }
 

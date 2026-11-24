@@ -21,6 +21,12 @@ const BASE_FLAGS = {
 
 const base = (id: string, name: string, biome: BiomeId): VehicleDef => ({ id, name, biomes: [biome], ...BASE_FLAGS });
 
+/**
+ * How long timed vehicles last: the per-vehicle numbers below are relative lengths, multiplied by this. At 3 a 10 becomes
+ * 30 rows ≈ 2 s at cruise speed. The course generator sizes each pickup's window from the final length.
+ */
+const TIMED_LENGTH = 3;
+
 type TimedFields = Partial<Omit<VehicleDef, 'id' | 'name' | 'biomes' | 'base' | 'durationRows'>>;
 const timed = (id: string, name: string, biomes: BiomeId[], durationRows: number, f: TimedFields): VehicleDef => ({
   id,
@@ -28,7 +34,7 @@ const timed = (id: string, name: string, biomes: BiomeId[], durationRows: number
   biomes,
   ...BASE_FLAGS,
   base: false,
-  durationRows,
+  durationRows: durationRows * TIMED_LENGTH,
   ...f,
 });
 

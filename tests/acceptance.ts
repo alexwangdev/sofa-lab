@@ -16,6 +16,7 @@ import type { BiomeId, Course } from '../src/shared/types.ts';
 import { createApp } from '../src/server/app.ts';
 import { decide } from '../src/shared/autopilot.ts';
 import { MemoryRedis, fakeReddit } from '../src/server/memory.ts';
+import { extendTo, keepAhead, newEndless } from '../src/shared/endless.ts';
 
 const day = (i: number): string => new Date(Date.UTC(2026, 0, 1) + i * 86_400_000).toISOString().slice(0, 10);
 
@@ -147,28 +148,29 @@ test('3. pickups: 2 per segment, placement rules, reachable from the safe line a
 });
 
 // ---------- 4 ----------
-test('4. Helicopter: ignores Crash and Slow for exactly 8 rows, no Collect/Gate, base again on row 9', () => {
-  const P = 100;
+test('4. Helicopter: ignores Crash and Slow for exactly its duration, no Collect/Gate, base again right after', () => {
+  const P = 60;
+  const D = vehicle('helicopter').durationRows;
   const c = withPickup('snow', 'helicopter', P, 4);
-  for (let r = P + 1; r <= P + 7; r++) put(c, r, 4, r % 2 ? Cell.Crash : Cell.Slow);
+  for (let r = P + 1; r <= P + D - 1; r++) put(c, r, 4, r % 2 ? Cell.Crash : Cell.Slow);
   put(c, P + 3, 4, Cell.Collect);
   put(c, P + 5, 4, Cell.Gate);
   c.gateRows.set(P + 5, 0);
-  put(c, P + 8, 4, Cell.Crash);
+  put(c, P + D, 4, Cell.Crash);
   const s = stateAt(c, P - 1, 4);
   s.combo = 2;
   enterRow(s, P, 0);
   const speed = s.speed;
-  runTo(s, P + 7);
-  assert.equal(s.phase, 'run', 'flies over crash rows 1–8');
+  runTo(s, P + D - 1);
+  assert.equal(s.phase, 'run', 'flies over every crash row while active');
   assert.equal(s.speed, speed, 'slow ignored');
   assert.equal(s.collects, 0, 'no collect');
   assert.equal(s.gates, 0, 'no gate');
   assert.equal(s.combo, 2, 'noGate keeps the combo');
-  assert.equal(vehicleFor(s, P + 7).id, 'helicopter');
-  assert.equal(vehicleFor(s, P + 8).id, 'ski', 'row 9 is the base vehicle');
-  enterRow(s, P + 8, 0);
-  assert.equal(s.phase, 'crash', 'Crash is deadly again on row 9');
+  assert.equal(vehicleFor(s, P + D - 1).id, 'helicopter');
+  assert.equal(vehicleFor(s, P + D).id, 'ski', 'the row after expiry is the base vehicle');
+  enterRow(s, P + D, 0);
+  assert.equal(s.phase, 'crash', 'Crash is deadly again after expiry');
 });
 
 // ---------- 5 ----------
@@ -194,19 +196,20 @@ test('5. Snowmobile moves 2 lanes in one row; Speedboat cools down after a 2-lan
 });
 
 // ---------- 6 ----------
-test('6. Lava surfboard: lava is Normal for 10 rows, straight only; Crash again after expiry', () => {
-  const P = 80;
+test('6. Lava surfboard: lava is Normal for its duration, straight only; Crash again after expiry', () => {
+  const P = 60;
+  const D = vehicle('lavasurf').durationRows;
   const c = withPickup('volcano', 'lavasurf', P, 3);
-  for (let r = P + 1; r <= P + 12; r++) put(c, r, 3, Cell.Crash);
+  for (let r = P + 1; r <= P + D + 2; r++) put(c, r, 3, Cell.Crash);
   const s = stateAt(c, P - 1, 3);
   enterRow(s, P, 0);
-  for (let r = P + 1; r <= P + 9; r++) {
+  for (let r = P + 1; r <= P + D - 1; r++) {
     enterRow(s, r, r % 2 ? 1 : -1);
     assert.equal(s.lane, 3, 'no lane change while active');
     assert.equal(s.phase, 'run', `lava row ${r} is Normal`);
   }
-  enterRow(s, P + 10, 0);
-  assert.equal(s.phase, 'crash', 'lava is Crash after 10 rows');
+  enterRow(s, P + D, 0);
+  assert.equal(s.phase, 'crash', 'lava is Crash after expiry');
 });
 
 // ---------- 7 ----------
@@ -229,8 +232,11 @@ test('7. Rocket backpack: skips 2 rows per step, skipped rows score nothing, lan
   assert.equal(s.phase, 'run', 'skipped crash cells never resolve');
   assert.equal(s.collects, 0, 'skipped collect gives nothing');
   assert.equal(s.rowsScored - rows0, 2, 'only the two landing rows score');
-  assert.equal(vehicleFor(s, s.row + 1).id, 'rover', 'back to base after 6 rows');
-  assert.equal(nextRow(s), P + 7);
+  const D = vehicle('rocket').durationRows;
+  assert.equal(vehicleFor(s, P + D - 1).id, 'rocket');
+  assert.equal(vehicleFor(s, P + D).id, 'rover', 'back to base after its duration');
+  while (s.row < P + D && s.phase === 'run') enterRow(s, nextRow(s), 0);
+  assert.equal(nextRow(s), s.row + 1, 'normal steps again');
 });
 
 // ---------- 8 ----------
@@ -344,4 +350,25 @@ test('autopilot finishes whole daily runs (5 days, holding Tuck)', () => {
     assert.equal(s.phase, 'finish', `${c.date}: ${s.phase} at row ${s.row}`);
     assert.ok(score(s).finish > TIME_POINTS, 'faster than par');
   }
+});
+
+// ---------- endless mode ----------
+test('endless: legs join without a finish line, the track is the same per date, and the autopilot gets through 4 legs', () => {
+  const a = newEndless('2026-11-23');
+  const b = newEndless('2026-11-23');
+  extendTo(a, ROWS * 4);
+  extendTo(b, ROWS * 4);
+  assert.ok(a.rows > ROWS * 4 && a.biomes.length === (a.rows / ROWS) * 3);
+  assert.deepEqual(a.cells, b.cells, 'same date → same endless track');
+  assert.ok(!a.cells.includes(Cell.Finish), 'no finish line anywhere');
+  for (let k = 1; k < a.biomes.length; k++) assert.notEqual(a.biomes[k], a.biomes[k - 1], 'no biome twice in a row');
+  const s = newRun(a, computePar());
+  startRun(s);
+  while (s.phase === 'run' && s.row < ROWS * 4) {
+    keepAhead(s);
+    tick(s, s.tick === 0 ? [IN.fastOn] : [], decide);
+    s.events.length = 0;
+  }
+  assert.equal(s.phase, 'run', `crashed at row ${s.row}`);
+  assert.ok(s.broken.size + s.taken.size < 400, 'cells far behind are forgotten');
 });
