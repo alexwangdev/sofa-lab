@@ -1,56 +1,46 @@
-import { GERVER, isPlain, parFor } from '../shared/sofa';
-import { dailyChallenge } from '../shared/daily';
-import type { DailyChallenge } from '../shared/daily';
-import type { RedisLike } from './ports';
+/** Seed, biome shuffle and par time for a date (spec §5, §10), cached in puzzle:{date}. */
+import { dailyRoute, dailySeed, generateCourse } from '../shared/course.ts';
+import { computePar } from '../shared/sim.ts';
+import { ROWS } from '../shared/grid.ts';
+import { BIOME_IDS } from '../shared/types.ts';
+import type { BiomeId, Course } from '../shared/types.ts';
+import type { RedisLike } from './ports.ts';
 
-export type Puzzle = DailyChallenge & {
-  /** Best possible area today under the test; null if the computation failed. */
-  par: number | null;
-  /** The par shape (server-only; revealed the next day). */
-  parCells: number[];
-  /** Ceiling shown to the player: Gerver on a clean w = 1 day, otherwise par. */
-  target: number | null;
-  targetLabel: string;
-};
+/** `rows` records the track length the par was computed for; a stored puzzle for another length is recomputed. */
+export type Puzzle = { biomes: [BiomeId, BiomeId, BiomeId]; parSeconds: number; rows: number };
 
-export function labelFor(ch: DailyChallenge, par: number | null): { target: number | null; targetLabel: string } {
-  if (ch.course.w === 1 && isPlain(ch.course)) return { target: GERVER, targetLabel: `Gerver ${GERVER}` };
-  if (par === null) return { target: null, targetLabel: 'target: —' };
-  return { target: par, targetLabel: `Par ${par.toFixed(2)}` };
+export const kPuzzle = (date: string) => `puzzle:${date}`;
+
+function parsePuzzle(raw: string | undefined): Puzzle | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as Partial<Puzzle>;
+    const ids: readonly string[] = BIOME_IDS;
+    if (!Array.isArray(v.biomes) || v.biomes.length !== 3 || !v.biomes.every((b) => ids.includes(b))) return null;
+    if (typeof v.parSeconds !== 'number' || v.rows !== ROWS) return null;
+    return { biomes: [v.biomes[0], v.biomes[1], v.biomes[2]] as [BiomeId, BiomeId, BiomeId], parSeconds: v.parSeconds, rows: ROWS };
+  } catch {
+    return null;
+  }
 }
 
-/**
- * The day's challenge (pure, from the date seed) + its par, computed once by the intersection method and cached at
- * puzzle:{date}. `wOverride` exists only for local mode (dev toolbar); production never passes it.
- */
-export async function getPuzzle(redis: RedisLike, date: string, wOverride?: number): Promise<Puzzle> {
-  const ch = dailyChallenge(date, wOverride);
-  const key = `puzzle:${date}`;
-  const sig = JSON.stringify(ch.course);
-  let par: number | null = null;
-  let parCells: number[] = [];
-  try {
-    const raw = await redis.get(key);
-    if (raw) {
-      const parsed: unknown = JSON.parse(raw);
-      if (typeof parsed === 'object' && parsed !== null && 'sig' in parsed && 'par' in parsed && parsed.sig === sig && typeof parsed.par === 'number') {
-        par = parsed.par;
-        if ('cells' in parsed && Array.isArray(parsed.cells)) parCells = parsed.cells.filter((c): c is number => typeof c === 'number');
-        if (parCells.length === 0) par = null; // old cache entry without the shape: recompute
-      }
-    }
-  } catch (err) {
-    console.error('puzzle cache read failed', err);
+export async function getPuzzle(redis: RedisLike, date: string): Promise<Puzzle> {
+  const stored = parsePuzzle(await redis.get(kPuzzle(date)));
+  if (stored) return stored;
+  const puzzle: Puzzle = { biomes: dailyRoute(dailySeed(date)), parSeconds: computePar(), rows: ROWS };
+  await redis.set(kPuzzle(date), JSON.stringify(puzzle));
+  return puzzle;
+}
+
+/** The server's own copy of the track; it wins over the client's. */
+const courseCache = new Map<string, Course>();
+export function courseFor(date: string, puzzle: Puzzle): Course {
+  const key = `${date}:${puzzle.biomes.join()}`;
+  let c = courseCache.get(key);
+  if (!c) {
+    c = generateCourse(date, puzzle.biomes);
+    courseCache.set(key, c);
+    if (courseCache.size > 8) courseCache.delete(courseCache.keys().next().value as string);
   }
-  if (par === null) {
-    try {
-      const p = parFor(ch.course);
-      par = p.area;
-      parCells = p.cells;
-      await redis.set(key, JSON.stringify({ sig, w: ch.course.w, par, cells: parCells }));
-    } catch (err) {
-      console.error('par compute/cache failed', err);
-    }
-  }
-  return { ...ch, par, parCells, ...labelFor(ch, par) };
+  return c;
 }

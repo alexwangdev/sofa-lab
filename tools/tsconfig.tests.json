@@ -6,14 +6,25 @@
     "types": [
       "node"
     ],
-    "rootDir": ".."
+    "rootDir": "..",
+    "lib": [
+      "DOM",
+      "ES2023"
+    ]
   },
   "include": [
-    "../tests/**/*"
+    "../tests/**/*",
+    "../tools/**/*.ts"
   ],
   "references": [
     {
       "path": "./tsconfig.shared.json"
+    },
+    {
+      "path": "./tsconfig.server.json"
+    },
+    {
+      "path": "./tsconfig.client.json"
     }
   ]
 }

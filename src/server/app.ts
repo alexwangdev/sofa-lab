@@ -1,332 +1,215 @@
 /**
- * All HTTP routes (spec §8 + internal endpoints), independent of where they run.
- * Production: src/server/index.ts passes Devvit's redis/reddit/context. Local mode: src/server/local.ts passes fakes.
+ * HTTP routes (spec §12–§13), independent of where they run. Production: index.ts binds Devvit's redis/reddit/context.
+ * Local mode and tests: memory.ts fakes. The server is the source of truth for the track and the best score.
  */
 import { Hono } from 'hono';
 import type { Context as HonoContext } from 'hono';
-import { runTest } from '../shared/sofa';
-import { isDateString, medalFor, prevDate } from '../shared/daily';
-import type {
-  ErrorResponse,
-  LeaderboardEntry,
-  LeaderboardResponse,
-  RevealResponse,
-  RevealShape,
-  SubmitResult,
-  TestResult,
-  TodayResponse,
-} from '../shared/types';
-import { getPuzzle } from './daily';
-import { shareLines } from '../shared/share';
-import type { Env, RedisLike } from './ports';
+import { BIOMES } from '../shared/biomes.ts';
+import { FINISH_ROW, ROWS } from '../shared/grid.ts';
+import { isDateString, prevDate } from '../shared/rng.ts';
+import { maxScore } from '../shared/sim.ts';
+import type { ErrorResponse, LeaderboardEntry, LeaderboardResponse, RunBody, RunResponse, TodayResponse } from '../shared/types.ts';
+import { courseFor, getPuzzle } from './daily.ts';
+import type { Puzzle } from './daily.ts';
+import type { Env, RedisLike } from './ports.ts';
 
-// ---------- Redis keys (spec §7) ----------
+// ---------- Redis keys (spec §12) ----------
 export const kLb = (date: string) => `lb:${date}`;
-export const kUser = (userId: string, date: string) => `user:${userId}:${date}`;
-export const kStreak = (userId: string) => `streak:${userId}`;
-/** Submit lock: hSetNX makes "one submit per day" atomic under concurrent requests. */
-export const kLock = (date: string) => `submitted:${date}`;
+const kUser = (userId: string, date: string) => `user:${userId}:${date}`;
+const kStreak = (userId: string) => `streak:${userId}`;
 export const kPost = (date: string) => `post:${date}`;
 
-type UserRecord = { area: number; cells: number[]; submittedAt: number; pass: boolean; username: string };
+type UserDay = { best: number; runs: number; finished: boolean; submittedAt: number; username: string };
 
-/**
- * Sorted-set score: area×1000 as an int (spec §7) in the high digits, plus an inverted time-of-day in the low
- * 8 digits so equal areas rank the earlier submission first (spec §6 tie-break). area×1000 = floor(score / 1e8).
- */
-const TIME_SPAN = 100_000_000;
-function lbScore(area: number, submittedAt: number): number {
-  const msOfDay = submittedAt % 86_400_000;
-  return Math.round(area * 1000) * TIME_SPAN + (TIME_SPAN - 1 - msOfDay);
-}
-const areaFromScore = (score: number): number => Math.floor(score / TIME_SPAN) / 1000;
-
-function parseUser(raw: string | null | undefined): UserRecord | null {
+function parseUser(raw: string | null | undefined): UserDay | null {
   if (!raw) return null;
   try {
-    const v: unknown = JSON.parse(raw);
-    if (typeof v !== 'object' || v === null || !('area' in v) || !('cells' in v) || !('submittedAt' in v)) return null;
-    if (typeof v.area !== 'number' || !Array.isArray(v.cells) || typeof v.submittedAt !== 'number') return null;
-    const cells = v.cells.filter((c): c is number => typeof c === 'number');
-    const pass = 'pass' in v && typeof v.pass === 'boolean' ? v.pass : v.area > 0;
-    const username = 'username' in v && typeof v.username === 'string' ? v.username : 'unknown';
-    return { area: v.area, cells, submittedAt: v.submittedAt, pass, username };
+    const v = JSON.parse(raw) as Partial<UserDay>;
+    if (typeof v.best !== 'number' || typeof v.runs !== 'number') return null;
+    return {
+      best: v.best,
+      runs: v.runs,
+      finished: v.finished === true,
+      submittedAt: typeof v.submittedAt === 'number' ? v.submittedAt : 0,
+      username: typeof v.username === 'string' ? v.username : 'unknown',
+    };
   } catch {
     return null;
   }
 }
 
-async function rankOf(redis: RedisLike, date: string, userId: string): Promise<number | null> {
-  const [asc, card] = await Promise.all([redis.zRank(kLb(date), userId), redis.zCard(kLb(date))]);
-  return asc === undefined ? null : card - asc;
-}
+const bad = (c: HonoContext, error: string, status: 400 | 401 | 409 | 500 = 400) => c.json<ErrorResponse>({ error }, status);
+const isInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v);
+const routeLine = (p: Puzzle) => p.biomes.map((b) => BIOMES[b].name).join(' → ');
 
-/** Streak as displayed: broken if there is no pass today or yesterday. */
-async function currentStreak(redis: RedisLike, userId: string, today: string): Promise<number> {
-  const [stored, t, y] = await Promise.all([
-    redis.get(kStreak(userId)),
-    redis.get(kUser(userId, today)),
-    redis.get(kUser(userId, prevDate(today))),
+/** Rank with the spec's tie-break: higher best first, then the earlier time that best was set. */
+async function rankOf(redis: RedisLike, date: string, userId: string, best: number, at: number): Promise<number> {
+  const [higher, tied] = await Promise.all([
+    redis.zRange(kLb(date), best + 1, Number.MAX_SAFE_INTEGER, { by: 'score' }),
+    redis.zRange(kLb(date), best, best, { by: 'score' }),
   ]);
+  const others = tied.filter((m) => m.member !== userId);
+  const recs = others.length > 0 ? await redis.mGet(others.map((m) => kUser(m.member, date))) : [];
+  let earlier = 0;
+  others.forEach((m, i) => {
+    const t = parseUser(recs[i])?.submittedAt ?? 0;
+    if (t < at || (t === at && m.member < userId)) earlier++;
+  });
+  return higher.length + earlier + 1;
+}
+
+/** Streak as displayed: alive if the user scored today or yesterday. */
+async function currentStreak(redis: RedisLike, userId: string, today: string): Promise<number> {
+  const [stored, t, y] = await Promise.all([redis.get(kStreak(userId)), redis.get(kUser(userId, today)), redis.get(kUser(userId, prevDate(today)))]);
   const n = stored ? Number.parseInt(stored, 10) || 0 : 0;
-  const alive = parseUser(t)?.pass === true || parseUser(y)?.pass === true;
-  return alive ? n : 0;
+  return parseUser(t) || parseUser(y) ? n : 0;
 }
 
-async function readCells(c: HonoContext): Promise<unknown> {
+function scoreBucket(score: number): string {
+  if (score < 1000) return '<1000';
+  if (score < 2000) return '1000-2000';
+  if (score < 3000) return '2000-3000';
+  return '3000+';
+}
+
+async function readBody(c: HonoContext): Promise<Record<string, unknown> | null> {
   try {
-    const body: unknown = await c.req.json();
-    if (typeof body === 'object' && body !== null && 'cells' in body) return body.cells;
-    return undefined;
+    const v: unknown = await c.req.json();
+    return typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
   } catch {
-    return undefined;
+    return null;
   }
-}
-
-const bad = (c: HonoContext, error: string, status: 400 | 401 | 409 | 500 = 400) =>
-  c.json<ErrorResponse>({ error }, status);
-
-function areaBucket(area: number): string {
-  if (area <= 0) return '0';
-  if (area < 1) return '<1';
-  if (area < 1.5) return '1-1.5';
-  if (area < 2) return '1.5-2';
-  if (area < 2.1) return '2-2.1';
-  if (area < 2.2) return '2.1-2.2';
-  return '2.2+';
 }
 
 export function createApp(env: Env): Hono {
   const { redis, reddit } = env;
-
-  // ---------- API (spec §8) ----------
   const api = new Hono();
 
   api.get('/today', async (c) => {
     const ctx = env.ctx(c);
-    const date = ctx.date;
-    const puzzle = await getPuzzle(redis, date, ctx.wOverride);
-    const { userId } = ctx;
-    let rec: UserRecord | null = null;
-    let rank: number | null = null;
-    let streak = 0;
+    const puzzle = await getPuzzle(redis, ctx.date);
+    let myBest: number | null = null;
+    let myStreak = 0;
+    let playedToday = false;
     let username: string | null = null;
-    let prevCells: number[] | null = null;
-    if (userId) {
-      const back: string[] = [];
-      for (let d = prevDate(date), i = 0; i < 7; i++, d = prevDate(d)) back.push(kUser(userId, d));
-      const [raw, s, u, prev] = await Promise.all([
-        redis.get(kUser(userId, date)),
-        currentStreak(redis, userId, date),
-        ctx.username(),
-        redis.mGet(back),
-      ]);
-      rec = parseUser(raw);
-      streak = s;
-      username = u ?? null;
-      if (rec) rank = await rankOf(redis, date, userId);
-      for (const p of prev) {
-        const r = parseUser(p);
-        if (r && r.cells.length > 0) {
-          prevCells = r.cells;
-          break;
-        }
-      }
+    if (ctx.userId) {
+      const [raw, streak, name] = await Promise.all([redis.get(kUser(ctx.userId, ctx.date)), currentStreak(redis, ctx.userId, ctx.date), ctx.username()]);
+      const rec = parseUser(raw);
+      myBest = rec ? rec.best : null;
+      playedToday = rec !== null;
+      myStreak = streak;
+      username = name ?? null;
     }
-    return c.json<TodayResponse>({
-      date,
-      weekday: puzzle.weekday,
-      difficulty: puzzle.difficulty,
-      twists: puzzle.twists,
-      course: puzzle.course,
-      w: puzzle.course.w,
-      par: puzzle.par,
-      target: puzzle.target,
-      targetLabel: puzzle.targetLabel,
-      hasSubmitted: rec !== null,
-      myArea: rec ? rec.area : null,
-      myCells: rec ? rec.cells : null,
-      myRank: rank,
-      prevCells,
-      streak,
-      username,
-    });
+    return c.json<TodayResponse>({ date: ctx.date, biomes: puzzle.biomes, parSeconds: puzzle.parSeconds, myBest, myStreak, playedToday, username });
   });
 
-  api.post('/test', async (c) => {
-    const ctx = env.ctx(c);
-    const { course } = await getPuzzle(redis, ctx.date, ctx.wOverride);
-    const res = runTest(await readCells(c), course);
-    if (!res.ok) return bad(c, res.error);
-    return c.json<TestResult>(res.result);
-  });
-
-  api.post('/submit', async (c) => {
+  api.post('/run', async (c) => {
     const ctx = env.ctx(c);
     const { userId, date } = ctx;
-    if (!userId) return bad(c, 'log in to submit', 401);
-    const puzzle = await getPuzzle(redis, date, ctx.wOverride);
-    const res = runTest(await readCells(c), puzzle.course);
-    if (!res.ok) return bad(c, res.error); // invalid → 400, no write
+    const b = await readBody(c);
+    if (!b) return bad(c, 'body must be JSON');
+    const { score, distance, gates, finished, seedCheck, time } = b;
+    if (!isInt(score) || score < 0) return bad(c, 'score must be an int ≥ 0');
+    if (!isInt(distance) || distance < 0 || distance > ROWS) return bad(c, `distance must be an int in [0, ${ROWS}]`);
+    if (!isInt(gates) || gates < 0) return bad(c, 'gates must be an int ≥ 0');
+    if (typeof finished !== 'boolean') return bad(c, 'finished must be a boolean');
+    if (!isInt(seedCheck)) return bad(c, 'seedCheck must be an int');
+    if (typeof time !== 'number' || !Number.isFinite(time) || time < 0) return bad(c, 'time must be a number ≥ 0');
+    if (!userId) return bad(c, 'log in to post a score', 401);
 
-    // One submit per user per UTC day (atomic).
-    const locked = await redis.hSetNX(kLock(date), userId, '1');
-    if (locked !== 1 || (await redis.exists(kUser(userId, date))) > 0) {
-      return bad(c, 'already submitted today', 409);
-    }
+    const puzzle = await getPuzzle(redis, date);
+    const course = courseFor(date, puzzle);
+    if (seedCheck !== course.checksum) return bad(c, 'track mismatch, reload the post', 409);
+    if (gates > course.gateRows.size) return bad(c, 'more gates than the track has');
+    if (finished && distance < FINISH_ROW) return bad(c, 'finished runs cover the whole track');
+    if (score > maxScore(course, puzzle.parSeconds)) return bad(c, 'score is not possible on this track');
+    const body: RunBody = { score, distance, gates, finished, seedCheck, time };
 
     const username = (await ctx.username()) ?? 'unknown';
-    const pass = res.result.pass;
-    const area = pass ? res.result.area : 0;
-    const submittedAt = Date.now();
-    const rec: UserRecord = { area, cells: res.cells, submittedAt, pass, username };
-
+    const prev = parseUser(await redis.get(kUser(userId, date)));
+    const now = Date.now();
+    const improved = !prev || body.score > prev.best;
+    const rec: UserDay = {
+      best: improved ? body.score : prev.best,
+      runs: (prev?.runs ?? 0) + 1,
+      finished: (prev?.finished ?? false) || body.finished,
+      submittedAt: improved ? now : prev.submittedAt,
+      username,
+    };
     await redis.set(kUser(userId, date), JSON.stringify(rec));
-    await redis.zAdd(kLb(date), { member: userId, score: lbScore(area, submittedAt) });
+    if (improved) await redis.zAdd(kLb(date), { member: userId, score: rec.best });
 
-    let streak = 0;
-    if (pass) {
+    // streak: consecutive UTC days with a scored run, counted once per day
+    let streak: number;
+    if (!prev) {
       const y = parseUser(await redis.get(kUser(userId, prevDate(date))));
-      if (y?.pass) streak = await redis.incrBy(kStreak(userId), 1);
-      else {
-        await redis.set(kStreak(userId), '1');
-        streak = 1;
-      }
-    } else {
-      await redis.set(kStreak(userId), '0');
+      const stored = Number.parseInt((await redis.get(kStreak(userId))) ?? '0', 10) || 0;
+      streak = y ? stored + 1 : 1;
+      await redis.set(kStreak(userId), String(streak));
+    } else streak = await currentStreak(redis, userId, date);
+
+    const rank = await rankOf(redis, date, userId, rec.best, rec.submittedAt);
+
+    // flair: best-effort, never blocks the result
+    const flair = rank <= 10 ? `Top 10 · ${rec.best}` : streak >= 7 ? '7-day explorer' : body.finished ? `Finisher · ${body.score}` : null;
+    if (flair && ctx.subredditName && username !== 'unknown') {
+      reddit.setUserFlair({ subredditName: ctx.subredditName, username, text: flair }).catch((err: unknown) => console.error('flair failed', err));
     }
-    const rank = await rankOf(redis, date, userId);
+    // Journeys: one event per finished run, score bucket only; crashes send nothing
+    if (body.finished) console.log(`[journey] finish bucket=${scoreBucket(body.score)}`);
 
-    // Flair: best-effort, never blocks submit (spec §7).
-    if (pass && ctx.subredditName && username !== 'unknown') {
-      const text =
-        rank !== null && rank <= 10 ? `Top 10 · ${area.toFixed(2)}` : streak >= 7 ? '7-day mover' : `Sofa ${area.toFixed(2)}`;
-      reddit.setUserFlair({ subredditName: ctx.subredditName, username, text }).catch((err: unknown) => {
-        console.error('flair failed', err);
-      });
-    }
-
-    // Journeys: one event per submit, area bucket only (no shape data). See README.
-    console.log(`[journey] submit bucket=${areaBucket(area)}`);
-
-    const medal = medalFor(area, puzzle.par);
-    return c.json<SubmitResult>({ date, w: puzzle.course.w, pass, area, rank, streak, target: puzzle.target, par: puzzle.par, medal });
+    return c.json<RunResponse>({ best: rec.best, rank, streak, improved });
   });
 
   api.get('/leaderboard', async (c) => {
     const ctx = env.ctx(c);
-    const q = c.req.query('date');
-    const date = q === undefined ? ctx.date : q;
+    const date = c.req.query('date') ?? ctx.date;
     if (!isDateString(date)) return bad(c, 'date must be YYYY-MM-DD');
-    const [rows, total] = await Promise.all([
-      redis.zRange(kLb(date), 0, 9, { by: 'rank', reverse: true }),
-      redis.zCard(kLb(date)),
-    ]);
-    const users = rows.length > 0 ? await redis.mGet(rows.map((r) => kUser(r.member, date))) : [];
-    const top: LeaderboardEntry[] = rows.map((r, i) => ({
-      rank: i + 1,
-      username: parseUser(users[i])?.username ?? 'unknown',
-      area: areaFromScore(r.score),
-    }));
+    const [rows, total] = await Promise.all([redis.zRange(kLb(date), 0, 29, { by: 'rank', reverse: true }), redis.zCard(kLb(date))]);
+    const recs = rows.length > 0 ? await redis.mGet(rows.map((r) => kUser(r.member, date))) : [];
+    const list = rows.map((r, i) => {
+      const u = parseUser(recs[i]);
+      return { member: r.member, score: r.score, at: u?.submittedAt ?? 0, username: u?.username ?? 'unknown' };
+    });
+    list.sort((a, b) => b.score - a.score || a.at - b.at || (a.member < b.member ? -1 : 1));
+    const top: LeaderboardEntry[] = list.slice(0, 10).map((r, i) => ({ rank: i + 1, username: r.username, score: r.score }));
     let me: LeaderboardResponse['me'] = null;
     if (ctx.userId) {
-      const score = await redis.zScore(kLb(date), ctx.userId);
-      const rank = score === undefined ? null : await rankOf(redis, date, ctx.userId);
-      if (score !== undefined && rank !== null) me = { rank, area: areaFromScore(score) };
+      const rec = parseUser(await redis.get(kUser(ctx.userId, date)));
+      if (rec) me = { rank: await rankOf(redis, date, ctx.userId, rec.best, rec.submittedAt), best: rec.best };
     }
     return c.json<LeaderboardResponse>({ date, top, me, total });
   });
 
-  /**
-   * Next-day reveal: a past day's par shape, its top player's sofa and the caller's own. Today is refused, so the
-   * answer only comes out once the day is over.
-   */
-  api.get('/reveal', async (c) => {
-    const ctx = env.ctx(c);
-    const q = c.req.query('date');
-    const date = q === undefined ? prevDate(ctx.date) : q;
-    if (!isDateString(date)) return bad(c, 'date must be YYYY-MM-DD');
-    if (date >= ctx.date) return bad(c, 'today is revealed tomorrow');
-    const puzzle = await getPuzzle(redis, date, ctx.wOverride);
-    const shapes: RevealShape[] = [];
-    if (puzzle.par !== null && puzzle.parCells.length > 0) shapes.push({ label: 'Par (best possible)', area: puzzle.par, cells: puzzle.parCells });
-    const [top] = await redis.zRange(kLb(date), 0, 0, { by: 'rank', reverse: true });
-    if (top) {
-      const rec = parseUser(await redis.get(kUser(top.member, date)));
-      if (rec && rec.pass) shapes.push({ label: `#1 u/${rec.username}`, area: rec.area, cells: rec.cells });
-    }
-    if (ctx.userId && ctx.userId !== top?.member) {
-      const mine = parseUser(await redis.get(kUser(ctx.userId, date)));
-      if (mine) shapes.push({ label: 'You', area: mine.area, cells: mine.cells });
-    }
-    return c.json<RevealResponse>({
-      date,
-      weekday: puzzle.weekday,
-      difficulty: puzzle.difficulty,
-      twists: puzzle.twists,
-      course: puzzle.course,
-      par: puzzle.par,
-      shapes,
-    });
-  });
-
-  /** "Share my sofa" — posts one comment, only when the user taps the button. Text built server-side. */
+  /** "Share my run": one comment, only on the user's tap. Text is built server-side from the stored best. */
   api.post('/share', async (c) => {
     const ctx = env.ctx(c);
-    const { userId, postId, date } = ctx;
-    if (!userId || !postId) return bad(c, 'not available here', 400);
-    const rec = parseUser(await redis.get(kUser(userId, date)));
-    if (!rec) return bad(c, 'submit first', 400);
-    const puzzle = await getPuzzle(redis, date, ctx.wOverride);
-    const streak = await currentStreak(redis, userId, date);
-    const text = shareLines({
-      weekday: puzzle.weekday,
-      difficulty: puzzle.difficulty,
-      area: rec.area,
-      pass: rec.pass,
-      par: puzzle.par,
-      medal: medalFor(rec.area, puzzle.par),
-      streak,
-      course: puzzle.course,
-    }).join('  \n');
+    if (!ctx.userId || !ctx.postId) return bad(c, 'not available here');
+    const rec = parseUser(await redis.get(kUser(ctx.userId, ctx.date)));
+    if (!rec) return bad(c, 'play a run first');
+    const puzzle = await getPuzzle(redis, ctx.date);
+    const text = `Grid Expedition ${rec.best} — ${routeLine(puzzle)}`;
     try {
-      await reddit.submitComment({ id: postId, text, runAs: 'USER' });
+      await reddit.submitComment({ id: ctx.postId, text, runAs: 'USER' });
       return c.json({ ok: true, text });
     } catch (err) {
-      console.error('share comment failed', err);
-      return bad(c, 'could not post comment', 500);
+      console.error('share failed', err);
+      return bad(c, 'could not post the comment', 500);
     }
   });
 
-  /** Subscribe prompt on the result card. */
-  api.post('/subscribe', async (c) => {
-    if (!env.ctx(c).userId) return bad(c, 'log in first', 401);
-    try {
-      await reddit.subscribeToCurrentSubreddit();
-      return c.json({ ok: true });
-    } catch (err) {
-      console.error('subscribe failed', err);
-      return bad(c, 'could not subscribe', 500);
-    }
-  });
-
-  // ---------- Internal: daily post, menu, install ----------
+  // ---------- internal: daily post, menu, install ----------
   async function createDailyPost(c: HonoContext): Promise<{ id: string; date: string }> {
-    const ctx = env.ctx(c);
-    const date = ctx.date;
-    const puzzle = await getPuzzle(redis, date, ctx.wOverride);
+    const { date } = env.ctx(c);
     const existing = await redis.get(kPost(date));
     if (existing) return { id: existing, date };
-    const post = await reddit.submitCustomPost({
-      title: `Sofa Lab — ${date} · ${puzzle.weekday} ${puzzle.difficulty}: hallway width ${puzzle.course.w}`,
-      postData: { date },
-    });
+    const puzzle = await getPuzzle(redis, date);
+    const post = await reddit.submitCustomPost({ title: `Grid Expedition — ${date}: ${routeLine(puzzle)}`, postData: { date } });
     await redis.set(kPost(date), post.id);
     return { id: post.id, date };
   }
 
   const internal = new Hono();
-
   internal.post('/scheduler/daily-post', async (c) => {
     try {
       const { id, date } = await createDailyPost(c);
@@ -337,7 +220,6 @@ export function createApp(env: Env): Hono {
       return c.json({ status: 'error' }, 500);
     }
   });
-
   internal.post('/menu/post-create', async (c) => {
     try {
       const { id } = await createDailyPost(c);
@@ -347,7 +229,6 @@ export function createApp(env: Env): Hono {
       return c.json({ showToast: 'Failed to create post' }, 400);
     }
   });
-
   internal.post('/triggers/on-app-install', async (c) => {
     try {
       const { id } = await createDailyPost(c);

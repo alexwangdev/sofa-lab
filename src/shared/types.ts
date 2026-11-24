@@ -1,108 +1,99 @@
-/** Cell index in the build grid: id = row * cols + col. Row 0 is the inner-wall side (local y = 0). */
-export type CellId = number;
+/** Shared types (spec §4, §7, §13). */
 
-/** A round column in the hallway (world coords). Sofa sample points may not enter it, ever. */
-export type Pillar = { cx: number; cy: number; r: number; kind: 'corner' | 'outer' | 'inner' };
+/** Generic cells (spec §4). A biome only renames them; never add a cell type for one biome. */
+export const Cell = {
+  Normal: 0,
+  Crash: 1,
+  Gate: 2,
+  Pole: 3,
+  Ramp: 4,
+  Fast: 5,
+  Slow: 6,
+  Collect: 7,
+  Pickup: 8,
+  Finish: 9,
+} as const;
 
-/** Everything that defines one day's challenge. Same for every player on that UTC date. */
+export const BIOME_IDS = ['snow', 'desert', 'volcano', 'ocean', 'jungle', 'icefield', 'city', 'space'] as const;
+export type BiomeId = (typeof BIOME_IDS)[number];
+
+export type VehicleId = string;
+
+/** One data row per vehicle (spec §7). Base vehicles: durationRows = Infinity and every flag off. */
+export type VehicleDef = {
+  id: VehicleId;
+  name: string;
+  biomes: readonly BiomeId[];
+  base: boolean;
+  durationRows: number;
+  /** 0, 1 or 2 lanes per row. */
+  lanesPerRow: 0 | 1 | 2;
+  ignoreCrash: boolean;
+  ignoreSlow: boolean;
+  /** Crash cell is destroyed (+5), run continues. Poles are never broken. */
+  breakCrash: boolean;
+  /** lanesPerRow forced to 0. */
+  straightOnly: boolean;
+  noCollect: boolean;
+  noGate: boolean;
+  /** 0, or 2: each step skips that many rows; their cells never resolve. Landing row allows 0 lane change. */
+  jumpRows: 0 | 2;
+  /** Ramp +20 × rampBonus. */
+  rampBonus: 1 | 2;
+  /** After a 2-lane move, the next row allows 0 lane change. */
+  turnCooldown: boolean;
+  /** Ramp cells act as Normal (Elephant: too heavy). Data flag, not a code path. */
+  noRamp: boolean;
+};
+
+export type Pickup = { row: number; lane: number; vehicle: VehicleId; segment: number };
+
 export type Course = {
-  /** Vertical-arm width (horizontal arm is always 1). */
-  w: number;
-  pillar: Pillar | null;
-  /** Build cells that can't be used today ("torn fabric"). */
-  torn: CellId[];
-};
-
-export type Difficulty = 'Easy' | 'Medium' | 'Hard' | 'Gerver';
-
-export type Medal = 'gold' | 'silver' | 'bronze' | null;
-
-/**
- * A rigid motion through the corner.
- * - `slide`: pure translation: in along the horizontal arm, then down the vertical arm, with the shape's left edge
- *   at x = ox in the junction (only shapes no wider than the vertical arm).
- * - `rotate`: Hammersley-type path. In the sofa's own frame the hallway turns by t (0 → 90°) while its
- *   inner corner runs along the semicircle q(t) = (bu + r·cos 2t, r·sin 2t). World = R(−t)·(p − q(t)).
- *   The sofa slides in before turning and slides down after.
- */
-export type Motion = { kind: 'slide'; ox: number } | { kind: 'rotate'; r: number; bu: number };
-
-/** Where a failing sofa got stuck. */
-export type JamPhase = 'approach' | 'turn' | 'exit';
-
-export type TestResult = {
-  pass: boolean;
-  /** cells × 0.01, rounded to 3 decimals. This is the area of the shape, not the score. */
-  area: number;
-  /** Angle in degrees where a cell left the hallway (failures only). 0 for approach, 90 for exit. */
-  jamAngle?: number;
-  jamPhase?: JamPhase;
-  /** Offending cells at the jam (failures only). */
-  jamCells?: CellId[];
-  /** Motion that passed, or the motion that got furthest before jamming. Used for the animation. */
-  motion: Motion | null;
-};
-
-export type ShapeCheck = { ok: true; cells: CellId[] } | { ok: false; error: string };
-
-export type TodayResponse = {
   date: string;
-  /** e.g. "Thu" */
-  weekday: string;
-  difficulty: Difficulty;
-  /** Human-readable list of today's twists, e.g. ["Pillar in the corner", "Torn fabric"]. */
-  twists: string[];
-  course: Course;
-  w: number;
-  /** Best possible area today under the test (intersection method). null if not computed. */
-  par: number | null;
-  /** Ceiling shown to the player: Gerver 2.2195 on a clean w = 1 day, otherwise par. */
-  target: number | null;
-  targetLabel: string;
-  hasSubmitted: boolean;
-  myArea: number | null;
-  myCells: CellId[] | null;
-  myRank: number | null;
-  /** Your most recent submission from the last 7 days before today (carve template). */
-  prevCells: CellId[] | null;
-  streak: number;
-  username: string | null;
+  seed: number;
+  biomes: readonly [BiomeId, BiomeId, BiomeId];
+  rows: number;
+  cols: number;
+  cells: Uint8Array;
+  /** Guaranteed-clear lane per row (generation only, never shown to the player). */
+  safe: Int8Array;
+  /** Gate row → gate index. */
+  gateRows: Map<number, number>;
+  pickups: Pickup[];
+  /** FNV-1a over the cells: client and server must agree on the track. */
+  checksum: number;
 };
 
-export type SubmitResult = {
-  date: string;
-  w: number;
-  pass: boolean;
-  /** Score: area if pass, 0 if fail. */
-  area: number;
-  rank: number | null;
-  streak: number;
-  target: number | null;
-  par: number | null;
-  medal: Medal;
-};
+export type Phase = 'ready' | 'run' | 'crash' | 'finish';
 
-export type LeaderboardEntry = { rank: number; username: string; area: number };
-
-export type LeaderboardResponse = {
-  date: string;
-  top: LeaderboardEntry[];
-  me: { rank: number; area: number } | null;
+export type ScoreParts = {
+  rows: number;
+  gates: number;
+  collect: number;
+  air: number;
+  breaks: number;
+  finish: number;
   total: number;
 };
 
-export type ErrorResponse = { error: string };
+// ---------- API (spec §13) ----------
 
-/** A shape shown in the next-day reveal. */
-export type RevealShape = { label: string; area: number; cells: CellId[] };
-
-/** Yesterday (or any past day): its challenge, the par shape, the top player's sofa, and yours. Never today. */
-export type RevealResponse = {
+export type TodayResponse = {
   date: string;
-  weekday: string;
-  difficulty: Difficulty;
-  twists: string[];
-  course: Course;
-  par: number | null;
-  shapes: RevealShape[];
+  biomes: [BiomeId, BiomeId, BiomeId];
+  parSeconds: number;
+  myBest: number | null;
+  myStreak: number;
+  /** Has the caller played today (skip the preview on later runs). */
+  playedToday: boolean;
+  username: string | null;
 };
+
+export type RunBody = { score: number; distance: number; gates: number; finished: boolean; seedCheck: number; time: number };
+
+export type RunResponse = { best: number; rank: number | null; streak: number; improved: boolean };
+
+export type LeaderboardEntry = { rank: number; username: string; score: number };
+export type LeaderboardResponse = { date: string; top: LeaderboardEntry[]; me: { rank: number; best: number } | null; total: number };
+
+export type ErrorResponse = { error: string };

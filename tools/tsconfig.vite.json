@@ -9,8 +9,7 @@
     "rootDir": ".."
   },
   "include": [
-    "../vite.config.ts",
-    "../vite.local.config.ts"
+    "../vite.config.ts"
   ],
   "exclude": []
 }

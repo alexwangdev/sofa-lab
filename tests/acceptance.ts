@@ -1,207 +1,343 @@
 /**
- * Spec §5.4 acceptance tests + §12 checks that don't need Reddit. Run: `npm run acceptance`.
- * Exits non-zero if any check fails. Same code path as the game test (runTest).
+ * Spec §17 acceptance tests. Run: npm test
+ * 1 route determinism · 2 base-only reachability · 3 pickup placement · 4–7 vehicle rules · 8 score cap (server)
+ * · 9 biome boundary. (10 is the manual playtest.)
  */
-import {
-  COLS,
-  GERVER,
-  HAMMERSLEY,
-  HAMMERSLEY_R,
-  ROWS,
-  cellIdOf,
-  hammersleyArea,
-  hammersleyCells,
-  maxAreaUnderTest,
-  biggestPiece,
-  cellCol,
-  hintsFor,
-  mirrorCell,
-  parFor,
-  runTest,
-  templateCells,
-} from '../src/shared/sofa.ts';
-import { shareLines } from '../src/shared/share.ts';
-import { dailyChallenge, pickWidth } from '../src/shared/daily.ts';
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { dailyRoute, dailySeed, generateCourse, isSolid } from '../src/shared/course.ts';
+import { BOUNDARIES, COLS, FINISH_ROW, ROWS, segmentOf } from '../src/shared/grid.ts';
+import { TIME_POINTS, computePar, enterRow, maxScore, nextRow, newRun, queueSteer, score, startRun, stateAt, step, timeScore, vehicleFor } from '../src/shared/sim.ts';
+import type { RunState } from '../src/shared/sim.ts';
+import { vehicle } from '../src/shared/vehicles.ts';
+import { BIOMES } from '../src/shared/biomes.ts';
+import { Cell } from '../src/shared/types.ts';
+import type { BiomeId, Course } from '../src/shared/types.ts';
+import { createApp } from '../src/server/app.ts';
+import { decide } from '../src/shared/autopilot.ts';
+import { MemoryRedis, fakeReddit } from '../src/server/memory.ts';
 
-let failures = 0;
-function check(name: string, ok: boolean, detail: string): void {
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name.padEnd(44)} ${detail}`);
-  if (!ok) failures++;
+const day = (i: number): string => new Date(Date.UTC(2026, 0, 1) + i * 86_400_000).toISOString().slice(0, 10);
+
+/** A blank synthetic track (all Normal) for rule tests. */
+function blank(biomes: [BiomeId, BiomeId, BiomeId]): Course {
+  return {
+    date: 'test',
+    seed: 1,
+    biomes,
+    rows: ROWS,
+    cols: COLS,
+    cells: new Uint8Array(ROWS * COLS),
+    safe: new Int8Array(ROWS).fill(4),
+    gateRows: new Map(),
+    pickups: [],
+    checksum: 0,
+  };
+}
+const put = (c: Course, r: number, l: number, k: number) => {
+  c.cells[r * COLS + l] = k;
+};
+function withPickup(biome: BiomeId, id: string, row: number, lane: number): Course {
+  const c = blank([biome, biome, biome]);
+  put(c, row, lane, Cell.Pickup);
+  c.pickups.push({ row, lane, vehicle: id, segment: segmentOf(row) });
+  return c;
+}
+/** Enter rows until `row`, each with request `req` (default 0). */
+function runTo(s: RunState, row: number, req = 0): void {
+  while (s.phase === 'run' && s.row < row) enterRow(s, nextRow(s), req);
 }
 
-function block(cols: number, rows: number, col0 = 0): number[] {
-  const out: number[] = [];
-  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) out.push(cellIdOf(col0 + c, r));
-  return out;
-}
-
-const t0 = performance.now();
-
-// 1. 1×1 square
-{
-  const res = runTest(block(10, 10, 13));
-  const ok = res.ok && res.result.pass && res.result.area === 1;
-  check('1x1 square must PASS', ok, res.ok ? `area=${res.result.area.toFixed(3)} motion=${JSON.stringify(res.result.motion)}` : res.error);
-}
-
-// 2. Semicircle radius 1 (= Hammersley r = 0)
-{
-  const cells = hammersleyCells(0);
-  const res = runTest(cells);
-  const ok = res.ok && res.result.pass;
-  check('semicircle r=1 must PASS', ok, res.ok ? `area=${res.result.area.toFixed(3)} (exact ${(Math.PI / 2).toFixed(3)}) motion=${JSON.stringify(res.result.motion)}` : res.error);
-}
-
-// 3. Hammersley r = 2/π
-{
-  const cells = hammersleyCells(HAMMERSLEY_R);
-  const res = runTest(cells);
-  const area = res.ok ? res.result.area : 0;
-  const ok = res.ok && res.result.pass && Math.abs(area - HAMMERSLEY) <= 0.03;
-  check('Hammersley r=2/pi must PASS, area ±0.03', ok, `area=${area.toFixed(3)} target=${HAMMERSLEY} diff=${(area - HAMMERSLEY).toFixed(3)} motion=${res.ok ? JSON.stringify(res.result.motion) : '-'}`);
-}
-
-// 4. 3×1 block
-{
-  const res = runTest(block(30, 10, 3));
-  const ok = res.ok && !res.result.pass && (res.result.jamAngle ?? 90) < 90;
-  check('3x1 block must FAIL, jam < 90°', ok, res.ok ? `pass=${res.result.pass} jamAngle=${res.result.jamAngle}° jamCells=${res.result.jamCells?.length}` : res.error);
-}
-
-// 5. Disconnected cell -> rejected by shape rules
-{
-  const cells = [...block(10, 10, 5), cellIdOf(20, 5)];
-  const res = runTest(cells);
-  const ok = !res.ok && res.error === 'sofa must be one piece';
-  check('disconnected shape must be REJECTED', ok, res.ok ? 'was tested, not rejected' : `error="${res.error}"`);
-}
-
-// Extra: tutorial sweep (§4: must pass for r <= ~0.64) on the tutorial grid
-{
-  const TUT_COLS = 40;
-  const failsAt: number[] = [];
-  for (let i = 0; i <= 64; i++) {
-    const r = i / 100;
-    const res = runTest(hammersleyCells(r, TUT_COLS), 1, TUT_COLS);
-    if (!res.ok || !res.result.pass) failsAt.push(r);
+// ---------- 1 ----------
+test('1. same date → same route and track; different dates differ', () => {
+  for (let i = 0; i < 6; i++) {
+    const a = generateCourse(day(i));
+    const b = generateCourse(day(i));
+    assert.deepEqual(a.biomes, b.biomes);
+    assert.equal(a.checksum, b.checksum);
+    assert.deepEqual(a.pickups, b.pickups);
+    assert.equal(new Set(a.biomes).size, 3, 'three distinct biomes');
   }
-  check('tutorial Hammersley r in [0,0.64] all PASS', failsAt.length === 0, failsAt.length ? `fails at r=${failsAt.join(',')}` : `65/65 pass; area(0.637)=${hammersleyArea(HAMMERSLEY_R).toFixed(3)}`);
-}
+  let differ = 0;
+  for (let i = 0; i < 6; i++) if (dailyRoute(dailySeed(day(i))).join() !== dailyRoute(dailySeed(day(i + 1))).join()) differ++;
+  assert.ok(differ >= 4, `routes differ on ${differ}/6 days`);
+});
 
-// Extra: the grid ceiling must stay below Gerver (nobody can "beat the theorem")
-{
-  for (const w of [0.85, 0.9, 1.0, 1.1, 1.15]) {
-    const m = maxAreaUnderTest(w);
-    const ok = w !== 1 || m.area < GERVER;
-    check(`max area under test, w=${w}`, ok, `max=${m.area.toFixed(3)} (r=${m.r})${w === 1 ? ` < Gerver ${GERVER}` : ''}`);
+// ---------- 2 ----------
+test('2. base-only reachability: 300 seeds, ≤1 lane change per 2 rows, no Ramp, no pickups', () => {
+  const bad: string[] = [];
+  for (let i = 0; i < 300; i++) {
+    const c = generateCourse(day(i * 7 + 3));
+    // state: [lane][cooldown] — cooldown 1 = changed lane on the previous row
+    let reach = Array.from({ length: COLS }, (_, l) => [l === c.safe[0], false]);
+    for (let r = 1; r <= FINISH_ROW; r++) {
+      const next = Array.from({ length: COLS }, () => [false, false]);
+      const ok = (l: number) => !isSolid(c.cells[r * COLS + l] ?? 0);
+      for (let l = 0; l < COLS; l++)
+        for (let cd = 0; cd < 2; cd++) {
+          if (!reach[l]?.[cd]) continue;
+          if (ok(l)) next[l]![0] = true;
+          if (cd === 0)
+            for (const d of [-1, 1]) {
+              const n = l + d;
+              if (n >= 0 && n < COLS && ok(n)) next[n]![1] = true;
+            }
+        }
+      reach = next;
+      if (!reach.some((x) => x[0] || x[1])) {
+        bad.push(`${c.date}@${r}`);
+        break;
+      }
+    }
   }
-}
+  assert.deepEqual(bad, []);
+});
 
-// Extra: invalid inputs rejected
-{
-  const bad: unknown[] = [[], [-1], [COLS * ROWS], [1.5], 'x', [0, 'a']];
-  const allRejected = bad.every((b) => !runTest(b).ok);
-  check('invalid inputs rejected', allRejected, `${bad.length} cases`);
-}
-
-// Twists: torn cells are rejected by shape rules; a corner column jams a sofa that used to pass.
-{
-  const ch = { w: 1, pillar: null, torn: [cellIdOf(15, 5)] };
-  const res = runTest(block(10, 10, 13), ch);
-  check('torn cell is REJECTED', !res.ok && res.error.includes('torn'), res.ok ? 'was accepted' : `error="${res.error}"`);
-
-  const ham = hammersleyCells(HAMMERSLEY_R);
-  const col = { w: 1, pillar: { kind: 'corner' as const, cx: 1, cy: 1, r: 0.7 }, torn: [] };
-  const r1 = runTest(ham, col);
-  const ok1 = r1.ok && !r1.result.pass && r1.result.jamPhase !== undefined;
-  check('corner column jams Hammersley', ok1, r1.ok ? `pass=${r1.result.pass} phase=${r1.result.jamPhase} angle=${r1.result.jamAngle}°` : r1.error);
-
-  // A pillar on the outer wall of the vertical arm: a 1x1 square passes on a plain day but must hit it on the way down.
-  const wall = { w: 1, pillar: { kind: 'outer' as const, cx: 1, cy: -0.8, r: 0.5 }, torn: [] };
-  const sq = block(10, 10, 13);
-  const plain = runTest(sq, 1);
-  const r2 = runTest(sq, wall);
-  const ok2 = plain.ok && plain.result.pass && r2.ok && !r2.result.pass;
-  check('wall pillar blocks the slide-out', ok2, r2.ok ? `plain=${plain.ok && plain.result.pass} pillar: pass=${r2.result.pass} phase=${r2.result.jamPhase}` : r2.error);
-}
-
-// Daily challenges: 4 weeks — par shape always passes its own day, Gerver day is clean, hard days par < easy days par.
-{
-  let bad = 0;
-  const byDiff: Record<string, number[]> = {};
-  const d = new Date('2026-11-23T00:00:00Z');
-  for (let i = 0; i < 28; i++) {
-    const date = d.toISOString().slice(0, 10);
-    const ch = dailyChallenge(date);
-    const par = parFor(ch.course);
-    const res = runTest(par.cells, ch.course);
-    if (!res.ok || !res.result.pass || res.result.area !== par.area) bad++;
-    if (ch.difficulty === 'Gerver' && (ch.course.w !== 1 || ch.course.pillar || ch.course.torn.length)) bad++;
-    (byDiff[ch.difficulty] ??= []).push(par.area);
-    d.setUTCDate(d.getUTCDate() + 1);
+// ---------- 3 ----------
+/** Breadth-first over real sim states: can the runner get from `from` to the target and survive? */
+function reachable(start: RunState, goal: (s: RunState) => boolean, untilRow: number): boolean {
+  let frontier: RunState[] = [start];
+  const seen = new Set<string>();
+  while (frontier.length > 0) {
+    const next: RunState[] = [];
+    for (const s of frontier) {
+      if (goal(s)) return true;
+      if (s.row >= untilRow) continue;
+      for (const req of [-2, -1, 0, 1, 2]) {
+        const t = clone(s);
+        enterRow(t, nextRow(t), req);
+        if (t.phase !== 'run') continue;
+        const key = `${t.row}:${t.lane}:${t.timed}:${t.timedUntil}:${t.lastMove}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        next.push(t);
+      }
+    }
+    frontier = next;
   }
-  const avg = (xs: number[] = []) => xs.reduce((a, b) => a + b, 0) / Math.max(1, xs.length);
-  const order = avg(byDiff.Easy) > avg(byDiff.Medium) && avg(byDiff.Medium) > avg(byDiff.Hard);
-  const summary = Object.entries(byDiff).map(([k, v]) => `${k} ${avg(v).toFixed(2)}`).join(', ');
-  check('28 days: par shapes pass, Easy > Medium > Hard', bad === 0 && order, `bad=${bad}; avg par: ${summary}`);
+  return false;
+}
+function clone(s: RunState): RunState {
+  return { ...s, broken: new Set(s.broken), taken: new Set(s.taken), events: [] };
 }
 
-
-// Carve tools + hints + share card
-{
-  // Mirror is an involution and the Hammersley template is mirror-symmetric.
-  const tmpl = templateCells(0.6);
-  const set = new Set(tmpl);
-  const sym = tmpl.every((c) => set.has(mirrorCell(c))) && tmpl.every((c) => mirrorCell(mirrorCell(c)) === c);
-  check('mirror + template symmetric', sym, `${tmpl.length} cells`);
-
-  // Hints on a failing shape: removing the red (early) cells must get further or pass.
-  const colDay = { w: 1, pillar: { kind: 'corner' as const, cx: 1, cy: 1, r: 0.67 }, torn: [] };
-  const big = templateCells(0.64);
-  const r0 = runTest(big, colDay);
-  let improved = 'template unexpectedly passed';
-  let okHint = false;
-  if (r0.ok && !r0.result.pass) {
-    const h = hintsFor(r0.cells, r0.result, colDay);
-    const kill = new Set([...h.early, ...h.late]);
-    const trimmed = biggestPiece(r0.cells.filter((c) => !kill.has(c)));
-    const r1 = runTest(trimmed, colDay);
-    okHint = h.early.length + h.late.length > 0 && r1.ok && (r1.result.pass || (r1.result.jamAngle ?? 0) >= (r0.result.jamAngle ?? 0));
-    improved = `red+orange=${kill.size}, after trim: pass=${r1.ok && r1.result.pass} area=${r1.ok ? r1.result.area : '-'}`;
+test('3. pickups: 2 per segment, placement rules, reachable from the safe line and back within the window', () => {
+  for (let i = 0; i < 300; i++) {
+    const c = generateCourse(day(i * 11 + 5));
+    for (const seg of [0, 1, 2]) assert.equal(c.pickups.filter((p) => p.segment === seg).length, 2, `${c.date} seg ${seg}`);
+    for (const p of c.pickups) {
+      const v = vehicle(p.vehicle);
+      assert.ok(v.biomes.includes(c.biomes[p.segment]!), `${p.vehicle} belongs to ${c.biomes[p.segment]}`);
+      assert.equal(c.cells[p.row * COLS + p.lane], Cell.Pickup, 'pickup cell is not Crash');
+      for (const b of BOUNDARIES) assert.ok(Math.abs(p.row - b) >= 8, `${c.date} pickup ${p.row} near boundary`);
+      for (const q of c.pickups) if (q !== p) assert.ok(Math.abs(q.row - p.row) >= 5, 'pickups ≥5 rows apart');
+      const off = Math.abs(p.lane - (c.safe[p.row] ?? 0));
+      assert.ok(off >= 1 && off <= 2, 'pickup is 1–2 lanes off the safe line');
+      // from the safe line 12 rows earlier, with the base vehicle, reach the pickup
+      const approach = stateAt(c, p.row - 12, c.safe[p.row - 12] ?? 4);
+      assert.ok(reachable(approach, (s) => s.row === p.row && s.lane === p.lane && s.timed === p.vehicle, p.row), `${c.date} reach ${p.vehicle}@${p.row}`);
+      // after grabbing it, the safe line is reachable again by expiry + 6 rows, alive
+      const after = stateAt(c, p.row - 1, p.lane);
+      enterRow(after, p.row, 0);
+      assert.equal(after.timed, p.vehicle);
+      const back = p.row + v.durationRows + 6;
+      assert.ok(reachable(after, (s) => s.row >= back - 1 && s.lane === c.safe[s.row], back), `${c.date} return from ${p.vehicle}@${p.row}`);
+    }
   }
-  check('trimming hinted cells helps', okHint, improved);
+});
 
-  // Hints on a passing shape: every green cell can be added and it still passes.
-  const par = parFor(1).cells;
-  const cols = par.map((c) => cellCol(c));
-  const lo = Math.min(...cols);
-  const trimmedPar = biggestPiece(par.filter((c) => cellCol(c) > lo + 1));
-  const rp = runTest(trimmedPar, 1);
-  let growOk = false;
-  let growDetail = '';
-  if (rp.ok && rp.result.pass) {
-    const h = hintsFor(rp.cells, rp.result, 1);
-    const grown = runTest([...rp.cells, ...h.grow], 1);
-    growOk = h.grow.length > 0 && grown.ok && grown.result.pass;
-    growDetail = `grow=${h.grow.length}, ${rp.result.area} → ${grown.ok ? grown.result.area : '-'}`;
+// ---------- 4 ----------
+test('4. Helicopter: ignores Crash and Slow for exactly 8 rows, no Collect/Gate, base again on row 9', () => {
+  const P = 100;
+  const c = withPickup('snow', 'helicopter', P, 4);
+  for (let r = P + 1; r <= P + 7; r++) put(c, r, 4, r % 2 ? Cell.Crash : Cell.Slow);
+  put(c, P + 3, 4, Cell.Collect);
+  put(c, P + 5, 4, Cell.Gate);
+  c.gateRows.set(P + 5, 0);
+  put(c, P + 8, 4, Cell.Crash);
+  const s = stateAt(c, P - 1, 4);
+  s.combo = 2;
+  enterRow(s, P, 0);
+  const speed = s.speed;
+  runTo(s, P + 7);
+  assert.equal(s.phase, 'run', 'flies over crash rows 1–8');
+  assert.equal(s.speed, speed, 'slow ignored');
+  assert.equal(s.collects, 0, 'no collect');
+  assert.equal(s.gates, 0, 'no gate');
+  assert.equal(s.combo, 2, 'noGate keeps the combo');
+  assert.equal(vehicleFor(s, P + 7).id, 'helicopter');
+  assert.equal(vehicleFor(s, P + 8).id, 'ski', 'row 9 is the base vehicle');
+  enterRow(s, P + 8, 0);
+  assert.equal(s.phase, 'crash', 'Crash is deadly again on row 9');
+});
+
+// ---------- 5 ----------
+test('5. Snowmobile moves 2 lanes in one row; Speedboat cools down after a 2-lane move', () => {
+  const c = withPickup('snow', 'snowmobile', 50, 4);
+  const s = stateAt(c, 49, 4);
+  enterRow(s, 50, 0);
+  enterRow(s, 51, 2);
+  assert.equal(s.lane, 6);
+  const base = stateAt(blank(['snow', 'snow', 'snow']), 49, 4);
+  enterRow(base, 50, 2);
+  assert.equal(base.lane, 5, 'base vehicle: 1 lane per row');
+
+  const o = withPickup('ocean', 'speedboat', 50, 4);
+  const b = stateAt(o, 49, 4);
+  enterRow(b, 50, 0);
+  enterRow(b, 51, -2);
+  assert.equal(b.lane, 2);
+  enterRow(b, 52, -2);
+  assert.equal(b.lane, 2, 'cooldown row: 0 lane change');
+  enterRow(b, 53, 1);
+  assert.equal(b.lane, 3, 'free again');
+});
+
+// ---------- 6 ----------
+test('6. Lava surfboard: lava is Normal for 10 rows, straight only; Crash again after expiry', () => {
+  const P = 80;
+  const c = withPickup('volcano', 'lavasurf', P, 3);
+  for (let r = P + 1; r <= P + 12; r++) put(c, r, 3, Cell.Crash);
+  const s = stateAt(c, P - 1, 3);
+  enterRow(s, P, 0);
+  for (let r = P + 1; r <= P + 9; r++) {
+    enterRow(s, r, r % 2 ? 1 : -1);
+    assert.equal(s.lane, 3, 'no lane change while active');
+    assert.equal(s.phase, 'run', `lava row ${r} is Normal`);
   }
-  check('growing into green cells still passes', growOk, growDetail);
+  enterRow(s, P + 10, 0);
+  assert.equal(s.phase, 'crash', 'lava is Crash after 10 rows');
+});
 
-  const lines = shareLines({ weekday: 'Thu', difficulty: 'Hard', area: 1.82, pass: true, par: 1.86, medal: 'gold', streak: 3, course: { w: 1, pillar: { kind: 'corner', cx: 1, cy: 1, r: 0.67 }, torn: [5] } });
-  const text = lines.join('\n');
-  check('share card: no shape data, medal + bar', lines.length === 4 && text.includes('🥇') && text.includes('🟩') && !/\[|\d{3},/.test(text), text.replace(/\n/g, ' | '));
-}
+// ---------- 7 ----------
+test('7. Rocket backpack: skips 2 rows per step, skipped rows score nothing, landing row 0 lane change', () => {
+  const P = 120;
+  const c = withPickup('space', 'rocket', P, 4);
+  put(c, P + 1, 4, Cell.Crash);
+  put(c, P + 2, 4, Cell.Crash);
+  put(c, P + 4, 4, Cell.Collect);
+  put(c, P + 5, 4, Cell.Crash);
+  const s = stateAt(c, P - 1, 4);
+  enterRow(s, P, 0);
+  const rows0 = s.rowsScored;
+  assert.equal(nextRow(s), P + 3, 'skips P+1, P+2');
+  enterRow(s, nextRow(s), 1);
+  assert.equal(s.row, P + 3);
+  assert.equal(s.lane, 4, 'landing row: 0 lane change');
+  assert.equal(nextRow(s), P + 6);
+  enterRow(s, nextRow(s), 0);
+  assert.equal(s.phase, 'run', 'skipped crash cells never resolve');
+  assert.equal(s.collects, 0, 'skipped collect gives nothing');
+  assert.equal(s.rowsScored - rows0, 2, 'only the two landing rows score');
+  assert.equal(vehicleFor(s, s.row + 1).id, 'rover', 'back to base after 6 rows');
+  assert.equal(nextRow(s), P + 7);
+});
 
+// ---------- 8 ----------
+test('8. score cap: a fabricated score above the track max is rejected, no write', async () => {
+  const redis = new MemoryRedis(null);
+  const date = '2026-11-22';
+  const app = createApp({
+    redis,
+    reddit: fakeReddit(() => undefined),
+    ctx: () => ({ userId: 't2_cheater', username: async () => 'cheater', postId: 't3_x', subredditName: 'sub', date }),
+  });
+  const today = (await (await app.request('/api/today')).json()) as { parSeconds: number };
+  const course = generateCourse(date);
+  const cap = maxScore(course, today.parSeconds);
+  const body = (score: number) =>
+    JSON.stringify({ score, distance: FINISH_ROW, gates: course.gateRows.size, finished: true, seedCheck: course.checksum, time: 40 });
+  const bad = await app.request('/api/run', { method: 'POST', body: body(cap + 1), headers: { 'Content-Type': 'application/json' } });
+  assert.equal(bad.status, 400);
+  const lb = (await (await app.request(`/api/leaderboard?date=${date}`)).json()) as { total: number };
+  assert.equal(lb.total, 0, 'leaderboard unchanged');
+  for (const [field, value] of [
+    ['score', -1],
+    ['score', 1.5],
+    ['distance', 701],
+  ] as const) {
+    const o = JSON.parse(body(100)) as Record<string, unknown>;
+    o[field] = value;
+    const r = await app.request('/api/run', { method: 'POST', body: JSON.stringify(o), headers: { 'Content-Type': 'application/json' } });
+    assert.equal(r.status, 400, `${field}=${value}`);
+  }
+  const ok = await app.request('/api/run', { method: 'POST', body: body(cap - 10), headers: { 'Content-Type': 'application/json' } });
+  assert.equal(ok.status, 200);
+  const lb2 = (await (await app.request(`/api/leaderboard?date=${date}`)).json()) as { total: number };
+  assert.equal(lb2.total, 1);
+});
 
-// §12.3 daily seed
-{
-  const dates = ['2026-11-16', '2026-11-17', '2026-11-18', '2026-11-19', '2026-11-20', '2026-11-21', '2026-11-22'];
-  const ws = dates.map(pickWidth);
-  let diff = 0;
-  for (let i = 1; i < ws.length; i++) if (ws[i] !== ws[i - 1]) diff++;
-  const stable = dates.every((d) => pickWidth(d) === pickWidth(d));
-  check('seed: >=4 of 6 day-to-day changes; stable', diff >= 4 && stable, `w=${ws.join(', ')} changes=${diff}/6`);
-}
+// ---------- 9 ----------
+test('9. biome boundary: the first row of each segment swaps the base vehicle and raises the banner, no pause, input kept', () => {
+  const c = blank(['snow', 'ocean', 'city']);
+  const s = newRun(c, computePar());
+  startRun(s);
+  const [B1, B2] = BOUNDARIES;
+  s.pos = B1 - 3;
+  s.row = B1 - 3;
+  s.speed = 12;
+  queueSteer(s, -1);
+  queueSteer(s, -1);
+  queueSteer(s, -1);
+  for (let i = 0; i < 40 && s.row < B1 + 3; i++) step(s, 1 / 60, { fast: false, brake: false });
+  assert.equal(s.phase, 'run', 'no pause');
+  assert.equal(vehicleFor(s, B1 - 1).id, BIOMES.snow.base);
+  assert.equal(vehicleFor(s, B1).id, BIOMES.ocean.base);
+  assert.ok(s.events.some((e) => e.kind === 'biome' && e.row === B1 && e.vehicle === 'jetski'), 'banner event at the first boundary');
+  assert.equal(s.lane, 4 - 2, 'queued input still applied across the boundary (2 queued max)');
+  s.row = B2 - 3;
+  s.pos = B2 - 3;
+  for (let i = 0; i < 40 && s.row < B2 + 1; i++) step(s, 1 / 60, { fast: false, brake: false });
+  assert.ok(s.events.some((e) => e.kind === 'biome' && e.row === B2 && e.vehicle === 'skateboard'));
+});
 
-console.log(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILED`} in ${(performance.now() - t0).toFixed(0)} ms`);
-process.exit(failures === 0 ? 0 : 1);
+test('par time comes from the sim and is stable', () => {
+  const a = computePar();
+  assert.equal(a, computePar());
+  assert.ok(a > 40 && a < 120, `par ${a}s`);
+});
+
+// ---------- time score (only for finishing; faster = more) ----------
+test('time score: only on finishing, faster always scores more, braking to a safe finish scores far less', () => {
+  const run = (input: { fast: boolean; brake: boolean }) => {
+    const s = newRun(blank(['snow', 'ocean', 'city']), computePar());
+    startRun(s);
+    for (let i = 0; i < 60 * 400 && s.phase === 'run'; i++) step(s, 1 / 60, input);
+    return s;
+  };
+  const brake = run({ fast: false, brake: true });
+  const cruise = run({ fast: false, brake: false });
+  const tuck = run({ fast: true, brake: false });
+  for (const s of [brake, cruise, tuck]) assert.equal(s.phase, 'finish');
+  assert.ok(tuck.time < cruise.time && cruise.time < brake.time);
+  assert.ok(score(tuck).finish > score(cruise).finish && score(cruise).finish > score(brake).finish, 'shorter time → more points');
+  assert.equal(score(cruise).finish, timeScore(cruise.time, cruise.parSeconds));
+  assert.ok(Math.abs(score(cruise).finish - TIME_POINTS) < 60, 'cruising ≈ par ≈ TIME_POINTS');
+  // the gap must outweigh what extra care can earn elsewhere (all gates at ×3 on a normal day is ~1500)
+  assert.ok(score(tuck).total - score(brake).total > 2000, `tuck ${score(tuck).total} vs brake ${score(brake).total}`);
+  // a crash gets no time score at all
+  const c = blank(['snow', 'ocean', 'city']);
+  put(c, 100, 4, Cell.Crash);
+  const s = newRun(c, computePar());
+  startRun(s);
+  for (let i = 0; i < 60 * 60 && s.phase === 'run'; i++) step(s, 1 / 60, { fast: false, brake: false });
+  assert.equal(s.phase, 'crash');
+  assert.equal(score(s).finish, 0);
+  // and the server cap still allows the fastest possible finish
+  assert.ok(maxScore(generateCourse(day(1)), computePar()) >= FINISH_ROW + timeScore(FINISH_ROW / 20, computePar()));
+});
+
+// ---------- autopilot: whole runs can be completed (the full sweep is `npm run autotest`) ----------
+test('autopilot finishes whole daily runs (5 days, holding Tuck)', () => {
+  for (let i = 0; i < 5; i++) {
+    const c = generateCourse(day(i * 37 + 11));
+    const s = newRun(c, computePar());
+    startRun(s);
+    for (let f = 0; f < 60 * 300 && s.phase === 'run'; f++) {
+      step(s, 1 / 60, { fast: true, brake: false }, decide);
+      s.events.length = 0;
+    }
+    assert.equal(s.phase, 'finish', `${c.date}: ${s.phase} at row ${s.row}`);
+    assert.ok(score(s).finish > TIME_POINTS, 'faster than par');
+  }
+});

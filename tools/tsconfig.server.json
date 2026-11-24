@@ -4,11 +4,13 @@
     "outDir": "../dist/types/server",
     "tsBuildInfoFile": "../dist/types/server/tsconfig.tsbuildinfo",
     "customConditions": [],
-    "types": ["node"],
+    "types": [],
     "exactOptionalPropertyTypes": false,
     "rootDir": "../src/server"
   },
-  "include": ["../src/server/**/*"],
+  "include": [
+    "../src/server/**/*"
+  ],
   "exclude": [],
   "references": [
     {

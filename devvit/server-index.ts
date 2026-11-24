@@ -1,11 +1,12 @@
-/** Production entry: the routes from app.ts, bound to Devvit's real redis / reddit / context. */
+/** Production entry: the routes from app.ts bound to Devvit's real redis / reddit / context. */
 import { serve } from '@hono/node-server';
 import { context, createServer, getServerPort, reddit, redis } from '@devvit/web/server';
-import { utcDate } from '../shared/daily';
-import { createApp } from './app';
+import { utcDate } from '../src/shared/rng.ts';
+import { createApp } from '../src/server/app.ts';
+import type { RedisLike } from '../src/server/ports.ts';
 
 const app = createApp({
-  redis,
+  redis: redis as unknown as RedisLike,
   reddit,
   ctx: () => ({
     userId: context.userId,
@@ -13,7 +14,6 @@ const app = createApp({
     postId: context.postId,
     subredditName: context.subredditName,
     date: utcDate(),
-    wOverride: undefined,
   }),
 });
 

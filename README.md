@@ -1,134 +1,167 @@
-# Sofa Lab
+# Grid Expedition (Ski Grid v2)
 
-Daily moving-sofa game for Reddit (Devvit Web, React 19 + Tailwind 4 + Canvas 2D, Hono server). Spec: [moving-sofa-spec.md](moving-sofa-spec.md).
+A daily grid-runner built to SPEC v1.0. Everyone gets the same 450-row track each UTC day, and one run crosses three biomes drawn from a pool of 8. Pickups swap your vehicle for a few rows, and planning which ones to grab is the game. It uses the same grid engine and pseudo-3D projection as Ski Grid: Canvas 2D, voxel boxes, a single perspective divide, no 3D engine and no physics engine.
 
-## Commands
+**Current form: a plain React + TypeScript web app for testing. No Devvit, no backend.** The spec's server routes (`src/server/app.ts`) run inside the page (`src/client/backend.ts`) on an in-memory Redis that is saved to localStorage. The routes and data stay exactly as they will be on Devvit; the move later is described in [devvit/README.md](devvit/README.md).
 
-| | |
+```
+npm install
+npm run dev       # http://localhost:5177
+npm test          # spec §17 acceptance tests 1–9 + scoring and autopilot checks (node:test)
+npm run build     # tsc --build + vite build → dist/ (static files, relative paths; host anywhere)
+npm run preview   # serve dist/ on http://localhost:5178
+```
+
+The dashed **TEST** bar under the controls lets you switch players (you / alice / bob / carol) to fill the leaderboard, set the UTC date to try other routes or test streaks, reset the day or all data, and fire the daily-post job. Reddit actions (flair, comment, daily post) are only logged to the browser console. "Share my run" copies the comment text to the clipboard.
+
+## Scoring: time counts, but only if you finish
+
+Without a time component, riding the brakes to a safe finish was the best strategy. Now:
+
+- **Time score = 3000 × par ÷ your total time**, awarded **only for reaching the finish** (`timeScore` in `sim.ts`). Par is the cruise time from the same speed model (≈49.3 s for 450 rows), so finishing at par is worth 3000. There is no time limit and no cap: shorter is always better.
+- A crash gets no time score, only the points collected on the way: +1 per row, gates (+30/60/90 combo), collect +10, air +20/40, smash +5. These replaced the old finish +200 and +25 per second under par.
+- On an empty track: braking all the way takes 149.5 s for 990 time points (1439 total); cruising takes 49.3 s for 3000 (3449); holding Tuck takes 27.2 s for 5438 (5887). Fast and risky beats slow and safe; slow and safe still beats crashing.
+- The HUD shows the elapsed time as `time/par`, amber once slower than par. The result card shows "Time 41.5 s (par 49.3 s) → 3566", or after a crash "Time score: finish to earn it".
+- The server's score cap allows the fastest physically possible finish (every row at the speed cap).
+
+## Autopilot: can every run be finished?
+
+`src/shared/autopilot.ts` drives a run with the real rules. Before each row it tries every lane request 6 rows deep on cloned states (the same `enterRow` a player runs, so pickups, ramps, smashing and hops all count), rejects lines that crash, prefers lines that stay survivable 16 rows further on, then the best score (slow cells and poles count against a line). Speed never changes which rows are safe, so it holds Tuck the whole way.
+
+- `npm run autotest` plays 60 daily tracks start to finish at 60 Hz and prints per day: route, finished or FAIL, time, score, time points, gates and pickups, plus the exact cell and vehicle of any crash. It exits with code 1 if any run fails. Options: `-- --days 200 --from 2026-01-01`, `--cruise` (no Tuck).
+- Results so far: **200/200** days of 2026 finished holding Tuck (avg 27.2 s, avg score 7118, every gate passed) and **60/60** finished cruising (avg 48.8 s, avg score 4703). About 0.9 s per run.
+- `--all-routes` plays every ordered biome route (8 × 7 × 6 = 336), and `--grab` makes the autopilot go out of its way for pickups. Both print coverage: finished/runs for each biome in each segment position, and for each timed vehicle how often it was offered, picked up, rows driven, and runs that crashed while driving it.
+- Results: **336/336** routes finished (every biome 42/42 in each position). With `--grab` also 336/336, and all 15 timed vehicles were driven (Subway 88×, Zipline 131×, Balloon 120×, Rocket 252×, …) with no crash while driving any of them.
+- `npm test` includes a 5-day autopilot run.
+- Dev hooks for visual checks (dev server only): `window.__advance(row)` plays the current run with the autopilot up to a row synchronously (no animation frames needed), and `window.__snap(name)` saves a full-resolution frame to `.shots/name.jpg` through the dev server.
+- **In game:** tick **auto** in the TEST bar. The autopilot starts the run, steers, holds Tuck, and starts the next run 3 s after each result.
+
+## Look: voxel models + one visual language
+
+Models are built from basic shapes (box, cylinder, ellipsoid, cone, line, mirror) in a voxel grid of 12 voxels per track cell (`src/client/voxel.ts`; all models are in `src/client/models.ts`). Each model is baked once per view angle into a lit sprite and drawn as a billboard scaled by the same F / dz as the grid. This is the classic pseudo-3D racer technique, and the world underneath is still the grid. Baking is limited to about 6 ms a frame; until a new angle is ready, the nearest baked view is reused.
+
+Performance:
+- **Track length** is one constant, `ROWS` in `src/shared/grid.ts` (now 450 rows ≈ 900 m, three segments of 150). Segments, walls, gate widths, par, the score cap and the UI all derive from it. Stored puzzles record the length, so changing it recomputes par.
+- **Streaming**: the track data is ~4 KB and stays whole (the preview, minimap and server score check need it). What streams is the expensive part, the baked sprites. Models are tagged by biome. While the preview is open, the first two biomes bake in idle time (`prewarmCourse`). Entering a segment evicts the passed biome (views and fog tints freed) and queues the next one, so about two biomes of sprites exist at a time (about 3–5 megapixels). Row colour caches behind the runner are pruned. Shared and vehicle sprites unused for 20 s are dropped.
+- **Build-time atlases** (`npm run atlas`, also run by `dev` and `build`): `tools/bake-atlas.ts` builds every model in the catalog (`src/client/catalog.ts`) and rasterises every view it can be seen from. It uses the same pure-JS rasteriser as the game (`rasterize` in `voxel.ts`, no DOM, no canvas library), shelf-packs the views into ≤2048 px pages, and writes `atlas/<biome>.json` + `<biome>-<n>.png` (own PNG encoder on node:zlib). Result: 8 biomes, ~5,800 views, 9.2 MB total in ~22 s. At run time the game downloads only the day's biomes, each just before its segment (≈1–1.5 MB each), and **never bakes** (0 runtime bakes measured). A missing angle uses the nearest atlas view. If an atlas is missing, the same catalog is baked in idle time instead. Trade-off: decoded atlas pages take ~12–26 MB per biome, with at most two biomes held at once. The generated files are git-ignored.
+- **Bake size follows distance**: far views (small pitch) bake at 1–2 px per voxel, near ones at up to 4. Views off-screen for a given depth are never preloaded.
+- **Per frame**: sparse off-track scenery (the column next to the track stays empty), one plain strip per side per row, lane grid lines as one stroke per row, cached colours and fill strings, a cached sky. At most ~6 ms of on-demand baking a frame; otherwise the nearest baked angle is shown and the right one bakes in idle time.
+- **Ground in one pass:** side strips and the lane base are long polygons (one per colour run). All special and checker cells are batched by colour, the grid and track edges are one stroke per colour, and boost arrows, slow ripples and hazard brackets are batched too. This cut ~500 fills and strokes per frame to a few dozen; per-row ground drawing had been most of the frame. The checker is only drawn within 22 rows.
+- **Fog is one gradient overlay** over the band beyond 14 rows, drawn right after the far rows. Before, every sprite angle had its own fog-tinted copy, which created and uploaded new canvases all the time and caused stutter.
+- **Runner angles cross-fade:** the runner blends the two nearest pre-rendered yaw angles instead of snapping between 10° steps, so lane changes no longer pop.
+- **Atlas pages are decoded and uploaded to the GPU in idle time** right after download, instead of on the first frame that uses them. The canvas component is memoised, so the 10 Hz HUD updates do not re-render it.
+- Dev profiler: `window.__profile()` plays a fresh run frame by frame and reports sim and draw times (p95, p99, worst frames). `window.__layers` switches ground, cells, grid, marks, objects, fog and sky on or off to measure each one. All dev hooks live in `src/client/devHooks.ts` and are not in the production bundle.
+- **Adaptive quality**: if drawing stays above 11 ms, the pixel ratio and draw distance step down (2×/46 rows → 1.5×/40 → 1×/32), and step back up after it stays under 4 ms.
+- Steady state is about 2 ms a frame at 360 px (desktop browser). Dev builds expose `window.__bench(frames, warmup)` and `window.__cache()`.
+
+The same reading applies in every biome:
+
+| Cell | On the track |
 |---|---|
-| `npm run acceptance` | §5.4 acceptance tests + ceiling check + §12.3 seed check (prints numbers, exits non-zero on failure) |
-| `npm run build` | `tsc --build` (strict) + `vite build` → `dist/client`, `dist/server` |
-| `npm run lint` | ESLint |
-| `npm run local` | **Local mode**, no Reddit needed: http://localhost:5199 runs the real client and the real server routes on an in-memory Redis (saved in `.local-data/`) and a fake Reddit. See below. |
-| `npm run login` / `npm run dev` | `devvit login`, then `devvit playtest` in your private test subreddit |
+| Crash | a tall or solid obstacle on a **red-tinted cell with red corner brackets** (also marks low hazards: lava, crevasse, crater) |
+| Slow | low rough stuff (moguls, dunes, waves, mud, crowd) on a muddy cell with **ripple lines** |
+| Fast | a **bright cyan pad with white forward arrows** that scroll |
+| Collect | a small spinning collectible (snowflake, drop, shard, shell, fruit, crystal, coin, sample) |
+| Pickup | a **gold ring + light beam** with the vehicle itself spinning above it |
 
-App is private / playtest only. Do **not** run `devvit publish`.
+The preview shows this legend for each of the day's three biomes. The TEST bar has a **models** button that opens a gallery of all 23 vehicles (two angles each) and every biome's legend.
 
-## Layout
+## Sound: synthesised, no audio files
 
-```
-src/shared/sofa.ts     shape rules + corner test + Hammersley + daily max (pure, no `any`; used by client preview and server)
-src/shared/daily.ts    UTC date, mulberry32 seed, width pick
-src/shared/types.ts    CellId, TestResult, SubmitResult, API payloads
-src/server/app.ts      Hono routes §8, Redis §7, scheduler, menu, install trigger, flair, share, subscribe
-src/server/index.ts    production entry: app.ts bound to Devvit redis/reddit/context
-src/server/local.ts    local mode: app.ts bound to in-memory Redis + fake Reddit, plus /api/__local dev routes
-src/server/ports.ts    the redis/reddit/context interface both entries satisfy
-src/server/daily.ts    puzzle:{date} cache, target compute
-src/client/*.tsx       App shell + result card, SofaCanvas (render/paint/animation), Hammersley tutorial
-src/client/api.ts      fetch wrappers
-src/client/DevToolbar.tsx, localMode.ts   local-mode toolbar (dev builds only, stripped from the Reddit build)
-tests/acceptance.ts    §5.4 tests
-```
+`src/client/sfx.ts` builds every sound at run time with the Web Audio API, so there is nothing to download or license.
 
-## Local mode (`npm run local`)
+- **One-shots** are short oscillator or filtered-noise envelopes:
+  - **gate**: a chime that climbs a semitone per gate in a row
+  - **missed**: a low blip
+  - **pole**: a thud
+  - **collect**: a two-note coin
+  - **air**: a rising whoosh, with a thump on landing
+  - **smash**: a crunch
+  - **slow**: a falling drone
+  - **boost**: a rising sweep
+  - **pickup**: an arpeggio
+  - **expire**: two falling notes
+  - **new biome**: a chime
+  - **crash**: a noise burst with a low drop
+  - **finish**: a fanfare
+  - **start**: two beeps
+  - **lane change**: a short swish
+  - The same sound is played at most once per 45 ms.
+- **Ride sound**: a looped noise buffer through a filter, plus an optional sawtooth engine and hoof or paw steps. Each vehicle has its own setting in `RIDES`, for example a hiss for skis, a low rumble for the skateboard, an engine for the jet ski, and slow hoof thuds for the ox cart. Pitch and volume follow speed, and the sound goes nearly silent in the air.
+- The audio starts on the first key or tap, because browsers require a gesture. Audio is suspended while the tab is hidden.
+- The run header has a button that cycles **Sound** (music and effects) → **No music** → **Muted**. The choice is remembered in localStorage.
 
-This uses the same client and the same server routes as on Reddit. Only Devvit's Redis, Reddit API and request context are swapped out:
-- **Redis** is in memory and is saved to `.local-data/redis.json`, so your data survives restarts.
-- **Reddit actions** (flair, share comment, subscribe, daily post) are recorded instead of sent, and listed in the toolbar.
-- **Server edits** take effect on the next request, without a restart.
+### Background music (`src/client/music.ts`)
 
-The amber **LOCAL** pill in the bottom-right opens the toolbar:
-- **Player**: switch between u/you, alice, bob, carol and dave to test one-submit-per-day, ranks and ties.
-- **Hallway w**: force a width, or leave it on auto to use the date seed.
-- **Day**: move between days to test streaks and daily rollover.
-- **Seed 5 bot players**: real shapes submitted through the real `/api/submit` (Hammersley 2.20, 2.10, semicircle 1.54, a 0.9 block, and a 3×1 that jams and scores 0).
-- **Reset this day**, **Wipe everything**, **Run daily-post job**.
+The music is composed at run time as a 4-bar loop for each biome. Each biome has its own style:
 
-None of this is in the Reddit build: the toolbar is removed by `import.meta.env.DEV`, and `src/server/local.ts` isn't imported by `src/server/index.ts`.
-
-Caveat: if you submit a later day before an earlier one, the streak can look odd. Real days only move forward.
-
-## Playing loop (carve, hint, reveal, share)
-
-- **Carve**: **Start from…** gives you a Hammersley template with a bite-size slider, or your most recent sofa from the last 7 days. Templates skip torn cells. **Brush** cycles 1×1 / 2×2 / 3×3, and **Mirror** paints both sides of the box centre. If carving splits the sofa, the error comes with a **Remove loose bits** button.
-- **Hints after Test** (`hintsFor` in `src/shared/sofa.ts`). They only ever mark your own cells and their direct neighbours, never the whole safe region:
-  - **On a jam**: red = jams in the first half of the trip, orange = jams later. Colours come from the motion that needs the fewest cells trimmed, so they point at the smallest fix.
-  - **On a pass**: green outlines are empty neighbour cells that still fit. Adding them all still passes (tested).
-- **Next-day reveal**: **Yesterday's best sofas** shows the previous day's course with tabs for the par shape, the #1 player's sofa, and yours (`GET /api/reveal`). The server refuses today's date, so answers only come out once the day is over.
-- **Share card**: spoiler-free, with no shape data. It shows day, difficulty, medal, score / par (or Gerver on Gerver day), streak, a 10-square bar and the twists. **Copy** puts it on the clipboard; **Comment** posts it to the thread.
-
-## Where this deviates from the spec, and why
-
-The spec's literal geometry can't pass its own §5.4 tests, so §5.4's "adjust c(θ) first" rule applied. Every change below is the smallest one that gets all five tests to pass without hard-coding anything.
-
-1. **Test motion: a fixed family of motions instead of one c(θ).**
-   * The literal c(θ) = (0.5(1−cosθ), 0.5(1−sinθ)) gives c(0) = (0, 0.5), not (0, 0) as stated.
-   * No single rotating motion can pass a 1×1 square (its diagonal is √2, so it can never be at 45° in a width-1 hallway) and also pass Hammersley.
-   * The square only clears the corner by sliding, with no rotation.
-
-   A shape now passes if it survives **any** motion from one fixed, finite family. The family is the same for every user and every day:
-   * **slide**: pure translation. It works only if the shape is no wider than the vertical arm.
-   * **rotate(r, bu)**: Hammersley's motion. In the sofa's frame the hallway turns t = 0→90° in 60 equal steps, and its inner corner runs along q(t) = (bu + r·cos2t, r·sin2t). Here r ∈ {0, 0.01, …, 1}, and bu is any cell edge or cell centre.
-
-   The jam angle and red cells come from the motion that got furthest. The server returns that motion, and the client animates it.
-2. **Sample points are inset.** Each cell is sampled at its centre plus 4 points at ±0.01. This differs from the spec, which samples the 4 true corners.
-   * With true corners, the best possible grid shape is 1.94 and Hammersley rasterises to 1.88, which fails the ±0.03 test.
-   * With the centre only, the grid ceiling is 2.24, so players could "beat" Gerver's proven 2.2195.
-   * At ±0.01 Hammersley gets 2.200 (−0.007) and the grid ceiling is **2.20 < Gerver**, so the theorem holds in-game.
-3. **Build box is 36×10 (3.6 × 1), cell ids 0–359.** The spec has 30×10. Hammersley at r = 2/π is 2 + 2r ≈ 3.27 wide, so it doesn't fit in 3.0. API validation uses the 0–359 range.
-4. **Daily challenge: weekday difficulty + twists** (added on request; replaces spec §6 "only w changes"). See "Daily challenge" below.
-5. **Leaderboard score** = `area×1000 · 1e8 + (1e8 − 1 − ms-of-day)`. area×1000 is still an int in the high digits, and the low digits break ties in favour of the earlier submission.
-6. **Extra Redis keys:**
-   * `submitted:{date}` is a hash used with HSETNX, so "one submit per day" is atomic.
-   * `post:{date}` stops the scheduler, the menu and the install trigger from creating duplicate posts.
-   * `user:{id}:{date}` also stores `pass` and `username`, which the leaderboard needs.
-7. **A failed submit counts as the day's submit and scores 0**, as §3 says. The confirm dialog warns about this when the preview jams.
-8. **Journeys:** `@devvit/web` 0.15.4 has a `journeys` permission but no Journey-event API I could find. The submit handler logs `[journey] submit bucket=…` with the area bucket only, so a real call can drop in there.
-9. **Tutorial** uses a 40-column grid so Hammersley up to r = 1 isn't clipped. Every r in [0, 0.64] passes (tested). Real Hammersley sofas pass for every r.
-
-## Daily challenge
-
-Each UTC date picks a challenge from the date seed (mulberry32), so everyone gets the same one. The logic is in `src/shared/daily.ts`.
-
-| UTC day | Difficulty | Hallway w | Twists |
+| Biome | Mode | Tempo (BPM) | Character |
 |---|---|---|---|
-| Mon | Easy | 1.1 / 1.15 | none |
-| Tue | Medium | 0.9 / 1.0 / 1.1 | torn fabric |
-| Wed | Medium | 0.9 / 1.0 / 1.1 | pillar |
-| Thu | Hard | 0.85 / 0.9 / 1.0 | pillar + torn fabric |
-| Fri | Medium | 0.9 / 1.0 / 1.1 | pillar *or* torn fabric |
-| Sat | **Gerver day** | 1.0 | none — target is Gerver 2.2195 |
-| Sun | Hard | 0.85 / 0.9 / 1.0 | pillar + torn fabric |
+| Snow | major pentatonic | 112 | bells, bright |
+| Desert | phrygian dominant | 100 | plucky square lead |
+| Volcano | phrygian | 92 | low saw bass, heavy drums |
+| Ocean | mixolydian | 96 | sine pads, rolling arpeggios |
+| Jungle | dorian | 120 | marimba, full percussion |
+| Icefield | lydian | 84 | sparse bells, no drums |
+| City | natural minor | 124 | chiptune, driving beat |
+| Space | whole-tone | 72 | floating bells, no drums |
 
-**Pillars**, one of three kinds:
-- **Corner column** in the outer corner: r 0.55–0.65 on Medium days, 0.62–0.72 on Hard days.
-- **Outer-wall pillar** in the vertical arm.
-- **Inner-wall pillar** in the vertical arm.
+- **Melody**: generated from the day's seed, so each biome has its own tune that day, and every player hears the same one. Chord tones fall on the strong beats, with small steps in between.
+- **Layers**: a pad holding the chord, bass, lead, arpeggio and chip drums (sine kick, noise hat and snare).
+- **Speed**:
+  - The tempo goes from −15 % to +25 % of the biome's base tempo.
+  - Past half speed, arpeggios start.
+  - Near top speed, the drums go up one level, so the ambient biomes get a beat too.
+- **Phases**:
+  - Before the start, only the pad and a soft lead play.
+  - A new biome restarts the loop in its own style.
+  - On a crash or finish, the music fades out.
+- **Scheduling**: notes are queued about 0.2 s ahead on the audio clock from the render loop, so frame drops don't change the timing.
 
-No sample point may ever be inside the pillar. The test checks the slide in and the slide out exactly (each point's straight path), and the turn in 60 steps. A jam reports whether it happened on the way in, during the turn, or on the way out.
+## Layout (spec §16)
 
-**Torn fabric**: 2–3 small tears (2–4 cells each) in the middle of the build box. You can't paint those cells, and the API rejects them.
+```
+src/shared/types.ts     Cell, BiomeId, VehicleDef, API types
+src/shared/biomes.ts    §6 the 8 biomes: palette, cell names, base vehicle (data only)
+src/shared/vehicles.ts  §7–§8 VehicleDef rows: 8 base + 15 timed (data only)
+src/shared/grid.ts      rows/lanes, segments 0–149 / 150–299 / 300–449, cell lookup
+src/shared/course.ts    seed → biome shuffle; track generation, safe line, pickup planning
+src/shared/sim.ts       movement, cell resolution, scoring, par time, score cap; no rendering
+src/shared/rng.ts       FNV-1a + mulberry32, dates
+src/server/app.ts       §13 routes, Redis keys, flair, journeys log, daily post / menu / install
+src/server/daily.ts     puzzle:{date} = { biomes, parSeconds }, server-side course
+src/server/memory.ts    in-memory Redis + fake Reddit (browser-safe; used by the web build and the tests)
+src/client/backend.ts   runs the routes in the page (localStorage); api.ts calls it instead of fetch
+src/client/sfx.ts       Web Audio sound effects · music.ts: per-biome generated music (no files)
+src/client/voxel.ts     voxel modelling kit + sprite baker/cache · models.ts: every model
+src/client/Gallery.tsx  legend + model gallery
+src/client/…            App (HUD, result card, leaderboard), ExpeditionCanvas (loop + input),
+                        render.ts (projection, ground marks, billboards), TrackPreview (preview + minimap)
+tests/acceptance.ts     §17 tests 1–9
+devvit/                 devvit.json + the Devvit server entry, parked until the move (see devvit/README.md)
+```
 
-**Par** is the best possible area that day. It's computed with the intersection method over every motion and every placement in the box, with torn cells removed, and cached at `puzzle:{date}`. The par shape always passes its own day (tested over 28 days).
+`sim.ts` is imported by both the client (the live run) and the server (score bound and seedCheck). Vehicles have no code of their own; the sim only reads the flags in each row.
 
-**Medals**: Bronze ≥ 80%, Silver ≥ 90%, Gold ≥ 97% of par. Within a day, ranking is still by area (par is the same for everyone that day).
+## Decisions where the spec was open or conflicting
 
-Typical par:
-- Easy: about 2.39.
-- Medium: 1.7–2.3 (about 2.05 on average).
-- Hard: 1.3–1.9 (about 1.62 on average).
-- Gerver day: 2.20.
+- **Pickup window (§9).** "At least 12 rows before the dense section" and "the dense section is inside the duration" can't both hold for a 6–10-row vehicle. As built: there is a clear approach corridor from the safe line starting 12 rows before the pickup, and the dense patch starts 2 rows after the pickup and ends inside the vehicle's duration. To make this possible, pickup windows are planned first: the safe line stays fixed inside each window, and gates, ramps, and walls are kept out of it.
+- **Elephant "cannot use Ramp".** This needed a data flag, so I added `noRamp` to `VehicleDef`. It is still a data row, not a separate code path.
+- **Rocket backpack.** Every row where it lands is a "landing row", and landing rows allow 0 lane change. So while the rocket is active you hop straight ahead, 2 rows at a time.
+- **Missed gate.** Passing a gate row outside the opening counts as missed and resets the combo, the same as hitting a pole. While a `noGate` vehicle is active, gate rows do nothing and the combo is untouched.
+- **Ramp air** is a fixed 5 rows, so it can be planned from the preview.
+- **Leaderboard.** `lb:{date}` stores the plain best score. Ties are broken by when each player set that best (`submittedAt` in `user:{id}:{date}`).
+- **Score cap.** Each track gets a generous upper bound: every row, every gate at ×3, every Collect, every Ramp at +40, a break on every row of every breakCrash pickup, and a finish at top speed. Any score above it gets a 400. `seedCheck` is the track checksum; a mismatch gets a 409.
+- **Journeys.** One `[journey] finish bucket=…` log line per finished run, as in Sofa Lab. Nothing is sent for crashes.
+- **Canvas** is up to 480 px wide with a height:width ratio of about 3:2, capped by the viewport.
 
-The best bite radius changes from day to day (0.45–0.73), so yesterday's shape won't be today's best.
+## Status
 
-Max area in a plain hallway (no twists): w=0.85 → 1.67, 0.9 → 1.89, 1.0 → 2.20, 1.1 → 2.33, 1.15 → 2.41.
-
-## §12 checklist status
-
-1. Build passes: verified (`npm run build`, TS strict, no `any` in sofa.ts).
-2. Acceptance tests: verified (`npm run acceptance`).
-3. Daily seed: verified (`npm run acceptance`).
-4. Double submit rejected: verified in local mode with the real routes (second submit → 409, leaderboard byte-identical). Not yet run against Devvit's hosted Redis.
-5. Playtest flow: verified end-to-end in local mode at 360px, including streaks, ties, flair and share. Uploaded and installed in r/sofa_lab_dev (v0.0.1), but not yet played there.
-6. 360px viewport: verified, no horizontal scroll, buttons ≥44px.
+- `npm test` passes all 12 tests: §17 1–9, par time, time score, and the autopilot finishing 5 days. `npm run build` passes.
+- `npm run autotest -- --all-routes --grab` finishes 336 of 336 runs, covering every biome in every segment position.
+- Sound effects and per-biome music are synthesised at run time (no audio files).
+- Played in the browser at 360 px and at desktop size: preview → run → crash → result card → retry → finish (3314) → leaderboard → share (copied) → reload keeps best and streak → switching players and the next UTC day work. There are no `/api` network requests, and the built `dist/` runs on a static server.
+- Still to do:
+  - Try it on a real phone (touch, frame rate, iOS audio).
+  - Move it to Devvit and run §17 test 10 in a private subreddit (see devvit/README.md).
+- This repository previously held Sofa Lab. Its code is in the history at commit `827999c`.

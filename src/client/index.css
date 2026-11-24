@@ -3,24 +3,22 @@
 html,
 body {
   overflow-x: hidden;
+  -webkit-tap-highlight-color: transparent;
 }
 
 @layer components {
   .btn {
-    @apply min-h-11 rounded-lg px-2 text-sm font-semibold transition-colors cursor-pointer select-none
-      focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700
+    @apply min-h-11 min-w-11 rounded-lg px-3 text-sm font-semibold transition-colors cursor-pointer select-none
+      focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400
       disabled:cursor-not-allowed disabled:opacity-45;
   }
   .btn-primary {
-    @apply bg-blue-700 text-white hover:bg-blue-800;
+    @apply bg-orange-600 text-white hover:bg-orange-700;
   }
   .btn-secondary {
-    @apply bg-zinc-200 text-zinc-900 hover:bg-zinc-300;
+    @apply bg-slate-700 text-slate-100 hover:bg-slate-600;
   }
-  .btn-dark {
-    @apply bg-zinc-800 text-white hover:bg-zinc-900;
-  }
-  .btn-accent {
-    @apply bg-orange-700 text-white hover:bg-orange-800;
+  .btn-pad {
+    @apply bg-slate-800 text-slate-100 active:bg-sky-700 touch-none;
   }
 }
