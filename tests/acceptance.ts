@@ -1,13 +1,13 @@
 /**
  * Spec §17 acceptance tests. Run: npm test
- * 1 route determinism · 2 base-only reachability · 3 pickup placement · 4–7 vehicle rules · 8 score cap (server)
+ * 1 route determinism · 2 base-only reachability · 3 pickup placement · 4–7 vehicle rules · 8 score check (server replay)
  * · 9 biome boundary. (10 is the manual playtest.)
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { dailyRoute, dailySeed, generateCourse, isSolid } from '../src/shared/course.ts';
 import { BOUNDARIES, COLS, FINISH_ROW, ROWS, segmentOf } from '../src/shared/grid.ts';
-import { TIME_POINTS, computePar, enterRow, maxScore, nextRow, newRun, queueSteer, score, startRun, stateAt, step, timeScore, vehicleFor } from '../src/shared/sim.ts';
+import { IN, MAX_LOG, MAX_TICKS, TIME_POINTS, computePar, enterRow, nextRow, newRun, queueSteer, replay, score, startRun, stateAt, step, tick, timeScore, vehicleFor } from '../src/shared/sim.ts';
 import type { RunState } from '../src/shared/sim.ts';
 import { vehicle } from '../src/shared/vehicles.ts';
 import { BIOMES } from '../src/shared/biomes.ts';
@@ -234,7 +234,7 @@ test('7. Rocket backpack: skips 2 rows per step, skipped rows score nothing, lan
 });
 
 // ---------- 8 ----------
-test('8. score cap: a fabricated score above the track max is rejected, no write', async () => {
+test('8. score check: the server replays the inputs; a fabricated score or a forged log is rejected, no write', async () => {
   const redis = new MemoryRedis(null);
   const date = '2026-11-22';
   const app = createApp({
@@ -244,27 +244,33 @@ test('8. score cap: a fabricated score above the track max is rejected, no write
   });
   const today = (await (await app.request('/api/today')).json()) as { parSeconds: number };
   const course = generateCourse(date);
-  const cap = maxScore(course, today.parSeconds);
-  const body = (score: number) =>
-    JSON.stringify({ score, distance: FINISH_ROW, gates: course.gateRows.size, finished: true, seedCheck: course.checksum, time: 40 });
-  const bad = await app.request('/api/run', { method: 'POST', body: body(cap + 1), headers: { 'Content-Type': 'application/json' } });
-  assert.equal(bad.status, 400);
-  const lb = (await (await app.request(`/api/leaderboard?date=${date}`)).json()) as { total: number };
-  assert.equal(lb.total, 0, 'leaderboard unchanged');
-  for (const [field, value] of [
-    ['score', -1],
-    ['score', 1.5],
-    ['distance', 701],
-  ] as const) {
-    const o = JSON.parse(body(100)) as Record<string, unknown>;
-    o[field] = value;
-    const r = await app.request('/api/run', { method: 'POST', body: JSON.stringify(o), headers: { 'Content-Type': 'application/json' } });
-    assert.equal(r.status, 400, `${field}=${value}`);
+  // a real run (autopilot, holding Tuck), recorded tick by tick as the client does
+  const s = newRun(course, today.parSeconds);
+  startRun(s);
+  while (s.phase === 'run' && s.tick < MAX_TICKS) {
+    tick(s, s.tick === 0 ? [IN.fastOn] : [], decide);
+    s.events.length = 0;
   }
-  const ok = await app.request('/api/run', { method: 'POST', body: body(cap - 10), headers: { 'Content-Type': 'application/json' } });
+  assert.equal(s.phase, 'finish');
+  const real = score(s).total;
+  // the replay is exact: same score, time and row from the inputs alone
+  const r = replay(course, today.parSeconds, s.log);
+  assert.ok(r);
+  assert.deepEqual([score(r).total, r.time, r.row, r.lane], [real, s.time, s.row, s.lane]);
+
+  const post = (o: unknown) => app.request('/api/run', { method: 'POST', body: JSON.stringify(o), headers: { 'Content-Type': 'application/json' } });
+  const total = async () => ((await (await app.request(`/api/leaderboard?date=${date}`)).json()) as { total: number }).total;
+  assert.equal((await post({ score: real + 1, seedCheck: course.checksum, inputs: s.log })).status, 400, 'claimed more than the replay');
+  for (const inputs of [[1], [5, 0, 3, 0], [0, 99], [0.5, 0], 'x', new Array(MAX_LOG + 2).fill(0)])
+    assert.equal((await post({ score: real, seedCheck: course.checksum, inputs })).status, 400, `inputs ${JSON.stringify(inputs).slice(0, 30)}`);
+  assert.equal((await post({ score: -1, seedCheck: course.checksum, inputs: s.log })).status, 400);
+  assert.equal((await post({ score: real, seedCheck: course.checksum + 1, inputs: s.log })).status, 409, 'wrong track');
+  assert.equal(await total(), 0, 'leaderboard unchanged');
+
+  const ok = await post({ score: real, seedCheck: course.checksum, inputs: s.log });
   assert.equal(ok.status, 200);
-  const lb2 = (await (await app.request(`/api/leaderboard?date=${date}`)).json()) as { total: number };
-  assert.equal(lb2.total, 1);
+  assert.equal(((await ok.json()) as { score: number }).score, real);
+  assert.equal(await total(), 1);
 });
 
 // ---------- 9 ----------
@@ -323,8 +329,6 @@ test('time score: only on finishing, faster always scores more, braking to a saf
   for (let i = 0; i < 60 * 60 && s.phase === 'run'; i++) step(s, 1 / 60, { fast: false, brake: false });
   assert.equal(s.phase, 'crash');
   assert.equal(score(s).finish, 0);
-  // and the server cap still allows the fastest possible finish
-  assert.ok(maxScore(generateCourse(day(1)), computePar()) >= FINISH_ROW + timeScore(FINISH_ROW / 20, computePar()));
 });
 
 // ---------- autopilot: whole runs can be completed (the full sweep is `npm run autotest`) ----------

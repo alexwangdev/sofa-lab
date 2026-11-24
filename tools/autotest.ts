@@ -13,7 +13,7 @@ import { decide, makePilot } from '../src/shared/autopilot.ts';
 import { dailyRoute, dailySeed, generateCourse } from '../src/shared/course.ts';
 import { FINISH_ROW, cellAt, segmentOf } from '../src/shared/grid.ts';
 import { utcDate } from '../src/shared/rng.ts';
-import { computePar, newRun, score, startRun, step, vehicleFor } from '../src/shared/sim.ts';
+import { IN, MAX_TICKS, computePar, newRun, replay, score, startRun, tick, vehicleFor } from '../src/shared/sim.ts';
 import { BIOMES } from '../src/shared/biomes.ts';
 import { VEHICLE_LIST } from '../src/shared/vehicles.ts';
 import { BIOME_IDS, Cell } from '../src/shared/types.ts';
@@ -57,6 +57,7 @@ const byPos: Record<string, [number, number]> = {}; // "biome@seg" → [runs, fi
 const veh: Record<string, { offered: number; taken: number; rowsDriven: number; crashedIn: number }> = {};
 for (const v of VEHICLE_LIST) if (!v.base) veh[v.id] = { offered: 0, taken: 0, rowsDriven: 0, crashedIn: 0 };
 
+const replayMismatch: string[] = [];
 for (const job of jobs) {
   const course = generateCourse(job.date, job.biomes);
   for (const p of course.pickups) {
@@ -67,9 +68,10 @@ for (const job of jobs) {
   startRun(s);
   const t0 = performance.now();
   const taken: string[] = [];
-  for (let f = 0; f < 60 * 600 && s.phase === 'run'; f++) {
+  // the same fixed ticks and input log as the game
+  while (s.phase === 'run' && s.tick < MAX_TICKS) {
     const before = s.row;
-    step(s, 1 / 60, { fast, brake: false }, pilot);
+    tick(s, s.tick === 0 && fast ? [IN.fastOn] : [], pilot);
     if (s.timed !== null && s.row < s.timedUntil) {
       const v = veh[s.timed];
       if (v) v.rowsDriven += s.row - before;
@@ -83,6 +85,9 @@ for (const job of jobs) {
     s.events.length = 0;
   }
   const ms = performance.now() - t0;
+  // the server would score this run by replaying its inputs: it must come out identical
+  const rep = replay(course, par, s.log);
+  if (!rep || score(rep).total !== score(s).total || rep.time !== s.time || rep.phase !== s.phase) replayMismatch.push(`${job.date} ${job.biomes.join('/')}`);
   const sc = score(s);
   let why = '';
   if (s.phase === 'crash') {
@@ -145,4 +150,5 @@ for (const v of VEHICLE_LIST) {
 console.log(
   `\nfinished ${ok.length}/${rows.length} · avg time ${avg(ok.map((r) => r.time)).toFixed(1)} s · avg score ${Math.round(avg(ok.map((r) => r.total)))} · avg ${avg(rows.map((r) => r.ms)).toFixed(0)} ms per run`,
 );
-if (ok.length < rows.length) process.exitCode = 1;
+console.log(`replay check: ${rows.length - replayMismatch.length}/${rows.length} runs replay to the same score and time${replayMismatch.length ? ' · MISMATCH: ' + replayMismatch.slice(0, 5).join(', ') : ''}`);
+if (ok.length < rows.length || replayMismatch.length > 0) process.exitCode = 1;

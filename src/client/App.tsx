@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { PointerEvent as RPointerEvent, ReactNode } from 'react';
 import { BIOMES } from '../shared/biomes.ts';
 import { generateCourse } from '../shared/course.ts';
-import { BOUNDARIES, ROWS } from '../shared/grid.ts';
+import { BOUNDARIES, ROWS, segmentOf } from '../shared/grid.ts';
 import { METERS_PER_ROW, canControlSpeed, score } from '../shared/sim.ts';
 import type { RunState } from '../shared/sim.ts';
 import { vehicle } from '../shared/vehicles.ts';
@@ -13,6 +13,7 @@ import { ExpeditionCanvas } from './ExpeditionCanvas.tsx';
 import type { CanvasHandle } from './ExpeditionCanvas.tsx';
 import { MiniMap, TrackPreview } from './TrackPreview.tsx';
 import { prewarmCourse } from './render.ts';
+import { atlasLoading, readyToStart } from './atlas.ts';
 import { DevToolbar } from './DevToolbar.tsx';
 import { Gallery } from './Gallery.tsx';
 import { setSoundMode, soundMode } from './sfx.ts';
@@ -38,7 +39,34 @@ function SoundToggle() {
   );
 }
 
-type Hud = { score: number; row: number; phase: Phase; time: number; par: number; nextBiome: number | null; timed: string | null; timedLeft: number; canSpeed: boolean; taken: Set<number> };
+type Hud = {
+  score: number;
+  row: number;
+  phase: Phase;
+  time: number;
+  par: number;
+  nextBiome: number | null;
+  timed: string | null;
+  timedLeft: number;
+  canSpeed: boolean;
+  taken: Set<number>;
+  /** A biome's models still downloading: this one, or the next one when it is close. */
+  loading: { name: string; pct: number } | null;
+  canStart: boolean;
+};
+
+/** Start warning about the next biome's download this many rows before it. */
+const LOADING_AHEAD = 60;
+function loadingOf(s: RunState, next: number | undefined): Hud['loading'] {
+  const seg = segmentOf(s.row);
+  const segs = next !== undefined && next - s.row < LOADING_AHEAD ? [seg, seg + 1] : [seg];
+  for (const i of segs) {
+    const b = s.course.biomes[i as 0 | 1 | 2];
+    const f = atlasLoading(b);
+    if (f !== null) return { name: BIOMES[b].name, pct: Math.round(f * 100) };
+  }
+  return null;
+}
 type Result = {
   phase: 'crash' | 'finish';
   parts: ScoreParts;
@@ -64,6 +92,8 @@ function hudOf(s: RunState): Hud {
     par: s.parSeconds,
     canSpeed: canControlSpeed(s),
     taken: s.taken,
+    loading: loadingOf(s, next),
+    canStart: readyToStart(s.course.biomes[0]),
   };
 }
 
@@ -113,7 +143,8 @@ export function App() {
       const base: Result = { phase: s.phase === 'finish' ? 'finish' : 'crash', parts, distance: s.row, gates: s.gates, time: s.time, server: null, error: null };
       setResult(base);
       setShared('idle');
-      postRun({ score: parts.total, distance: s.row, gates: s.gates, finished: s.phase === 'finish', seedCheck: course.checksum, time: Math.round(s.time * 100) / 100 })
+      // the server replays s.log and scores the run itself; the claimed score must match its replay
+      postRun({ score: parts.total, seedCheck: course.checksum, inputs: s.log })
         .then((server) => {
           setResult({ ...base, server });
           setToday((t) => (t ? { ...t, myBest: server.best, myStreak: server.streak, playedToday: true } : t));
@@ -194,11 +225,16 @@ export function App() {
               <Overlay>
                 <p className="text-xl font-extrabold">{BIOMES[today.biomes[0]].name} first</p>
                 <p className="text-sm text-slate-300 text-center max-w-64">One lane per row. Crash cells end the run. Finish faster for a bigger time score (only if you reach the finish). Grab pickups to change how you move.</p>
-                <button className="btn btn-primary text-base px-6" onClick={() => canvas.current?.start()}>
-                  Start
+                <button className="btn btn-primary text-base px-6" disabled={!hud.canStart} onClick={() => canvas.current?.start()}>
+                  {hud.canStart ? 'Start' : `Loading ${hud.loading?.name ?? ''} ${hud.loading?.pct ?? 0}%`}
                 </button>
                 <p className="text-xs text-slate-400">Space · ← → lanes · ↑ tuck · ↓ brake</p>
               </Overlay>
+            )}
+            {hud?.phase === 'run' && hud.loading && (
+              <p className="absolute top-2 left-1/2 -translate-x-1/2 rounded-lg bg-slate-900/75 px-3 py-1 text-xs font-semibold pointer-events-none" role="status">
+                Loading {hud.loading.name} · {hud.loading.pct}%
+              </p>
             )}
             {result && (
               <ResultCard result={result} today={today} board={board} shared={shared} onShare={share} onRetry={retry} />

@@ -1,5 +1,5 @@
 /**
- * Build-time sprite atlases (made by `npm run atlas`, see tools/bake-atlas.ts): one JSON index + a few PNG pages per
+ * Build-time sprite atlases (made by `npm run atlas`, see tools/bake-atlas.ts): one JSON index + a few WebP pages per
  * biome under atlas/. The game downloads only the day's three biomes, each when its segment is coming up, and drops
  * it again once the segment is behind. If a file is missing (e.g. a dev server without atlases), the caller falls back
  * to baking the same catalog at run time.
@@ -14,14 +14,57 @@ type AtlasMeta = { biome: BiomeId; pages: string[]; items: Record<string, { lift
 
 const loads = new Map<BiomeId, Promise<boolean>>();
 
-function loadImage(src: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
+/** Download progress per biome, for the loading hint (bytes when the server sends sizes, else pages). */
+type Progress = { state: 'loading' | 'ready' | 'failed'; got: number[]; size: number[]; done: number; since: number };
+const progress = new Map<BiomeId, Progress>();
+
+/** 0…1 while a biome's atlas is downloading; null when it is ready, failed (run-time fallback) or never requested. */
+export function atlasLoading(biome: BiomeId): number | null {
+  const p = progress.get(biome);
+  if (!p || p.state !== 'loading') return null;
+  const total = p.size.reduce((a, b) => a + b, 0);
+  const got = p.got.reduce((a, b) => a + b, 0);
+  if (p.size.length > 0 && p.size.every((n) => n > 0)) return Math.min(0.99, got / total);
+  return p.got.length === 0 ? 0 : Math.min(0.99, p.done / p.got.length);
+}
+
+/** Longest a run waits for its first biome; after that it starts anyway and bakes missing sprites as it goes. */
+const START_WAIT_MS = 10_000;
+/** A run may start: the biome's atlas is in (or failed, or is taking too long). Requests it if nobody has yet. */
+export function readyToStart(biome: BiomeId): boolean {
+  const p = progress.get(biome);
+  if (!p) {
+    void loadBiomeAtlas(biome);
+    return false;
+  }
+  return p.state !== 'loading' || performance.now() - p.since > START_WAIT_MS;
+}
+
+/** Fetch one page, counting bytes as they arrive, then decode it from the downloaded blob. */
+async function loadPage(src: string, prog: Progress, i: number): Promise<HTMLImageElement> {
+  const res = await fetch(src);
+  if (!res.ok || !res.body) throw new Error(`atlas page ${src}`);
+  prog.size[i] = Number(res.headers.get('content-length')) || 0;
+  const reader = res.body.getReader();
+  const parts: Uint8Array<ArrayBuffer>[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    prog.got[i] = (prog.got[i] ?? 0) + value.length;
+  }
+  prog.size[i] = prog.got[i] ?? 0;
+  prog.done++;
+  const url = URL.createObjectURL(new Blob(parts, { type: res.headers.get('content-type') ?? 'image/webp' }));
+  try {
     const img = new Image();
     img.decoding = 'async';
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error(`atlas page ${src}`));
-    img.src = src;
-  });
+    img.src = url;
+    await img.decode();
+    return img;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }
 
 /**
@@ -52,12 +95,16 @@ function warmUp(pages: HTMLImageElement[]): void {
 export function loadBiomeAtlas(biome: BiomeId): Promise<boolean> {
   let p = loads.get(biome);
   if (p) return p;
+  const prog: Progress = { state: 'loading', got: [], size: [], done: 0, since: performance.now() };
+  progress.set(biome, prog);
   p = (async () => {
     const base = import.meta.env.BASE_URL;
     const res = await fetch(`${base}atlas/${biome}.json`);
     if (!res.ok) return false;
     const meta = (await res.json()) as AtlasMeta;
-    const pages = await Promise.all(meta.pages.map((f) => loadImage(`${base}atlas/${f}`)));
+    prog.got = meta.pages.map(() => 0);
+    prog.size = meta.pages.map(() => 0);
+    const pages = await Promise.all(meta.pages.map((f, i) => loadPage(`${base}atlas/${f}`, prog, i)));
     warmUp(pages);
     const byKey = new Map(biomeCatalog(biome).map((i) => [i.entry.key, i.entry]));
     for (const [key, item] of Object.entries(meta.items)) {
@@ -71,7 +118,12 @@ export function loadBiomeAtlas(biome: BiomeId): Promise<boolean> {
       e.complete = true;
     }
     return true;
-  })().catch(() => false);
+  })()
+    .catch(() => false)
+    .then((ok) => {
+      prog.state = ok ? 'ready' : 'failed';
+      return ok;
+    });
   loads.set(biome, p);
   return p;
 }
@@ -79,4 +131,5 @@ export function loadBiomeAtlas(biome: BiomeId): Promise<boolean> {
 /** Forget a biome's atlas (after its sprites were evicted) so a later run fetches it again (from the HTTP cache). */
 export function forgetBiomeAtlas(biome: BiomeId): void {
   loads.delete(biome);
+  progress.delete(biome);
 }

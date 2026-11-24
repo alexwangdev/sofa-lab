@@ -22,13 +22,13 @@ Without a time component, riding the brakes to a safe finish was the best strate
 - A crash gets no time score, only the points collected on the way: +1 per row, gates (+30/60/90 combo), collect +10, air +20/40, smash +5. These replaced the old finish +200 and +25 per second under par.
 - On an empty track: braking all the way takes 149.5 s for 990 time points (1439 total); cruising takes 49.3 s for 3000 (3449); holding Tuck takes 27.2 s for 5438 (5887). Fast and risky beats slow and safe; slow and safe still beats crashing.
 - The HUD shows the elapsed time as `time/par`, amber once slower than par. The result card shows "Time 41.5 s (par 49.3 s) → 3566", or after a crash "Time score: finish to earn it".
-- The server's score cap allows the fastest physically possible finish (every row at the speed cap).
+- The server does not take the client's word for any of this. It replays the run from its inputs and scores the replay (see "Score check" below).
 
 ## Autopilot: can every run be finished?
 
 `src/shared/autopilot.ts` drives a run with the real rules. Before each row it tries every lane request 6 rows deep on cloned states (the same `enterRow` a player runs, so pickups, ramps, smashing and hops all count), rejects lines that crash, prefers lines that stay survivable 16 rows further on, then the best score (slow cells and poles count against a line). Speed never changes which rows are safe, so it holds Tuck the whole way.
 
-- `npm run autotest` plays 60 daily tracks start to finish at 60 Hz and prints per day: route, finished or FAIL, time, score, time points, gates and pickups, plus the exact cell and vehicle of any crash. It exits with code 1 if any run fails. Options: `-- --days 200 --from 2026-01-01`, `--cruise` (no Tuck).
+- `npm run autotest` plays 60 daily tracks start to finish with the game's fixed 1/120 s ticks. It also replays every run from its input log, the same check the server makes, and reports any mismatch. It prints per day: route, finished or FAIL, time, score, time points, gates and pickups, plus the exact cell and vehicle of any crash. It exits with code 1 if any run fails. Options: `-- --days 200 --from 2026-01-01`, `--cruise` (no Tuck).
 - Results so far: **200/200** days of 2026 finished holding Tuck (avg 27.2 s, avg score 7118, every gate passed) and **60/60** finished cruising (avg 48.8 s, avg score 4703). About 0.9 s per run.
 - `--all-routes` plays every ordered biome route (8 × 7 × 6 = 336), and `--grab` makes the autopilot go out of its way for pickups. Both print coverage: finished/runs for each biome in each segment position, and for each timed vehicle how often it was offered, picked up, rows driven, and runs that crashed while driving it.
 - Results: **336/336** routes finished (every biome 42/42 in each position). With `--grab` also 336/336, and all 15 timed vehicles were driven (Subway 88×, Zipline 131×, Balloon 120×, Rocket 252×, …) with no crash while driving any of them.
@@ -41,9 +41,9 @@ Without a time component, riding the brakes to a safe finish was the best strate
 Models are built from basic shapes (box, cylinder, ellipsoid, cone, line, mirror) in a voxel grid of 12 voxels per track cell (`src/client/voxel.ts`; all models are in `src/client/models.ts`). Each model is baked once per view angle into a lit sprite and drawn as a billboard scaled by the same F / dz as the grid. This is the classic pseudo-3D racer technique, and the world underneath is still the grid. Baking is limited to about 6 ms a frame; until a new angle is ready, the nearest baked view is reused.
 
 Performance:
-- **Track length** is one constant, `ROWS` in `src/shared/grid.ts` (now 450 rows ≈ 900 m, three segments of 150). Segments, walls, gate widths, par, the score cap and the UI all derive from it. Stored puzzles record the length, so changing it recomputes par.
+- **Track length** is one constant, `ROWS` in `src/shared/grid.ts` (now 450 rows ≈ 900 m, three segments of 150). Segments, walls, gate widths, par, and the UI all derive from it. Stored puzzles record the length, so changing it recomputes par.
 - **Streaming**: the track data is ~4 KB and stays whole (the preview, minimap and server score check need it). What streams is the expensive part, the baked sprites. Models are tagged by biome. While the preview is open, the first two biomes bake in idle time (`prewarmCourse`). Entering a segment evicts the passed biome (views and fog tints freed) and queues the next one, so about two biomes of sprites exist at a time (about 3–5 megapixels). Row colour caches behind the runner are pruned. Shared and vehicle sprites unused for 20 s are dropped.
-- **Build-time atlases** (`npm run atlas`, also run by `dev` and `build`): `tools/bake-atlas.ts` builds every model in the catalog (`src/client/catalog.ts`) and rasterises every view it can be seen from. It uses the same pure-JS rasteriser as the game (`rasterize` in `voxel.ts`, no DOM, no canvas library), shelf-packs the views into ≤2048 px pages, and writes `atlas/<biome>.json` + `<biome>-<n>.png` (own PNG encoder on node:zlib). Result: 8 biomes, ~5,800 views, 9.2 MB total in ~22 s. At run time the game downloads only the day's biomes, each just before its segment (≈1–1.5 MB each), and **never bakes** (0 runtime bakes measured). A missing angle uses the nearest atlas view. If an atlas is missing, the same catalog is baked in idle time instead. Trade-off: decoded atlas pages take ~12–26 MB per biome, with at most two biomes held at once. The generated files are git-ignored.
+- **Build-time atlases** (`npm run atlas`, also run by `dev` and `build`): `tools/bake-atlas.ts` builds every model in the catalog (`src/client/catalog.ts`) and rasterises every view it can be seen from. It uses the same pure-JS rasteriser as the game (`rasterize` in `voxel.ts`, no DOM, no canvas library), shelf-packs the views into ≤2048 px pages, and writes `atlas/<biome>.json` + `<biome>-<n>.webp`. The pages are encoded with sharp, a build-time dev dependency, as lossy WebP at quality 85 with lossless alpha. Result: 8 biomes, ~5,800 views, **5.0 MB** total in ~8 s. The old PNGs were 9.3 MB, and side by side at 3× zoom the two look the same. At run time the game downloads only the day's biomes, each just before its segment (≈0.4–0.8 MB each), and **never bakes** (0 runtime bakes measured). A missing angle uses the nearest atlas view. If an atlas is missing, the same catalog is baked in idle time instead. Trade-off: decoded atlas pages take ~12–26 MB per biome, with at most two biomes held at once. The generated files are git-ignored.
 - **Bake size follows distance**: far views (small pitch) bake at 1–2 px per voxel, near ones at up to 4. Views off-screen for a given depth are never preloaded.
 - **Per frame**: sparse off-track scenery (the column next to the track stays empty), one plain strip per side per row, lane grid lines as one stroke per row, cached colours and fill strings, a cached sky. At most ~6 ms of on-demand baking a frame; otherwise the nearest baked angle is shown and the right one bakes in idle time.
 - **Ground in one pass:** side strips and the lane base are long polygons (one per colour run). All special and checker cells are batched by colour, the grid and track edges are one stroke per colour, and boost arrows, slow ripples and hazard brackets are batched too. This cut ~500 fills and strokes per frame to a few dozen; per-row ground drawing had been most of the frame. The checker is only drawn within 22 rows.
@@ -126,7 +126,7 @@ src/shared/biomes.ts    §6 the 8 biomes: palette, cell names, base vehicle (dat
 src/shared/vehicles.ts  §7–§8 VehicleDef rows: 8 base + 15 timed (data only)
 src/shared/grid.ts      rows/lanes, segments 0–149 / 150–299 / 300–449, cell lookup
 src/shared/course.ts    seed → biome shuffle; track generation, safe line, pickup planning
-src/shared/sim.ts       movement, cell resolution, scoring, par time, score cap; no rendering
+src/shared/sim.ts       movement, cell resolution, scoring, par time, fixed ticks + input log + replay; no rendering
 src/shared/rng.ts       FNV-1a + mulberry32, dates
 src/server/app.ts       §13 routes, Redis keys, flair, journeys log, daily post / menu / install
 src/server/daily.ts     puzzle:{date} = { biomes, parSeconds }, server-side course
@@ -141,7 +141,7 @@ tests/acceptance.ts     §17 tests 1–9
 devvit/                 devvit.json + the Devvit server entry, parked until the move (see devvit/README.md)
 ```
 
-`sim.ts` is imported by both the client (the live run) and the server (score bound and seedCheck). Vehicles have no code of their own; the sim only reads the flags in each row.
+`sim.ts` is imported by both the client (the live run) and the server, which replays submitted runs with it. Vehicles have no code of their own; the sim only reads the flags in each row.
 
 ## Decisions where the spec was open or conflicting
 
@@ -151,7 +151,21 @@ devvit/                 devvit.json + the Devvit server entry, parked until the 
 - **Missed gate.** Passing a gate row outside the opening counts as missed and resets the combo, the same as hitting a pole. While a `noGate` vehicle is active, gate rows do nothing and the combo is untouched.
 - **Ramp air** is a fixed 5 rows, so it can be planned from the preview.
 - **Leaderboard.** `lb:{date}` stores the plain best score. Ties are broken by when each player set that best (`submittedAt` in `user:{id}:{date}`).
-- **Score cap.** Each track gets a generous upper bound: every row, every gate at ×3, every Collect, every Ramp at +40, a break on every row of every breakCrash pickup, and a finish at top speed. Any score above it gets a 400. `seedCheck` is the track checksum; a mismatch gets a 409.
+- **Score check: the server replays every run.**
+  - The live run advances in fixed ticks of 1/120 s, and records each input as a `[tick, code]` pair in `s.log`. Inputs are lane left/right, Tuck on/off and Brake on/off. In auto mode, the autopilot's lane requests are recorded too.
+  - `POST /api/run` sends only `{ score, seedCheck, inputs }`. The server rebuilds the day's track, reruns the whole run from the inputs with the same `sim.ts` (`replay`), and stores the replay's score.
+  - The server rejects the run with a 400, and writes nothing, if the log is malformed (bad pairs, ticks out of order, unknown codes, over 40,000 numbers), if the run never ends within 10 minutes, or if the claimed score differs from the replay. A `seedCheck` mismatch gets a 409.
+  - The sim uses only + − × ÷ and min/max, so the replay comes out bit-identical in every JS engine. `npm run autotest -- --all-routes --grab` replays all 336 runs and they match exactly.
+  - What it does not stop: a bot that plays well. That needs input-timing analysis, which is out of scope here.
+  - The canvas draws between the last two ticks, so motion stays smooth at 60, 90, 120 or 144 Hz.
+- **Pause.**
+  - Open it with the ❚❚ button on the track, or the P or Esc key. Leaving the page also pauses: switching tabs or apps, opening devtools, or a phone call.
+  - While paused, the sim stops, the sound fades, and the track is hidden behind a 90 % overlay, so a pause is not free time to study the road ahead.
+  - Resume with the button, P, Esc or Space.
+- **Loading hint.** Atlas pages are fetched with byte-level progress.
+  - Before the first biome is in, the Start button reads "Loading Space 45%".
+  - After 10 s the run can start anyway: missing sprites are baked on the fly.
+  - During a run, a small "Loading Jungle · 60%" badge appears if the next biome is still downloading within 60 rows of it.
 - **Journeys.** One `[journey] finish bucket=…` log line per finished run, as in Sofa Lab. Nothing is sent for crashes.
 - **Canvas** is up to 480 px wide with a height:width ratio of about 3:2, capped by the viewport.
 

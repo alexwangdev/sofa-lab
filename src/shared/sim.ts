@@ -1,6 +1,10 @@
 /**
  * Movement, cell resolution and scoring (spec §3, §4, §7, §8, §10). No rendering. Imported by the client (live run)
- * and the server (score bounds). Rules resolve only when the runner enters a row; time only moves the runner forward.
+ * and the server (replay). Rules resolve only when the runner enters a row; time only moves the runner forward.
+ *
+ * Live runs move in fixed ticks (`tick`, 1/120 s) and record every input in `s.log`, so the server can replay the run
+ * from its inputs alone (`replay`) and score it itself. The sim uses only + − × ÷ and min/max, so the replay gives the
+ * same result in every JS engine.
  */
 import { BIOMES } from './biomes.ts';
 import { COLS, FINISH_ROW, cellAt, cellKey, segmentOf } from './grid.ts';
@@ -59,6 +63,10 @@ export type RunState = {
   /** Queued lateral move (lanes), consumed on entering the next row. */
   pending: number;
   parSeconds: number;
+  /** Fixed ticks run so far, the held Tuck/Brake state, and the input log ([tick, code] pairs; see `tick`). */
+  tick: number;
+  held: Input;
+  log: number[];
 };
 
 type Input = { fast: boolean; brake: boolean };
@@ -91,6 +99,9 @@ export function newRun(course: Course, parSeconds: number): RunState {
     speed: 0,
     pending: 0,
     parSeconds,
+    tick: 0,
+    held: { fast: false, brake: false },
+    log: [],
   };
 }
 
@@ -334,6 +345,87 @@ export function queueSteer(s: RunState, dir: -1 | 1): void {
   s.pending = Math.max(-2, Math.min(2, s.pending + dir));
 }
 
+// ---------- fixed ticks, input log, replay ----------
+
+export const TICK = 1 / 120;
+/** Longest run the server will replay (10 minutes; braking all the way takes ~2.5). */
+export const MAX_TICKS = 120 * 600;
+/** Longest input log the server accepts (numbers, i.e. 2 per input). */
+export const MAX_LOG = 40_000;
+/** Input codes: 0/1 lane left/right, 2/3 Tuck on/off, 4/5 Brake on/off, 6–10 autopilot lane request −2…+2. */
+export const IN = { left: 0, right: 1, fastOn: 2, fastOff: 3, brakeOn: 4, brakeOff: 5 } as const;
+const PILOT = 8;
+
+function applyInput(s: RunState, code: number): void {
+  if (code === IN.left || code === IN.right) queueSteer(s, code === IN.left ? -1 : 1);
+  else if (code === IN.fastOn || code === IN.fastOff) s.held.fast = code === IN.fastOn;
+  else if (code === IN.brakeOn || code === IN.brakeOff) s.held.brake = code === IN.brakeOn;
+  else s.pending = code - PILOT;
+}
+
+/** Codes that bring the held Tuck/Brake state to the wanted one (empty when nothing changed). */
+export function heldCodes(s: RunState, fast: boolean, brake: boolean): number[] {
+  const out: number[] = [];
+  if (fast !== s.held.fast) out.push(fast ? IN.fastOn : IN.fastOff);
+  if (brake !== s.held.brake) out.push(brake ? IN.brakeOn : IN.brakeOff);
+  return out;
+}
+
+/**
+ * One fixed tick of a live run: apply and record `codes`, then advance TICK seconds. A pilot's lane requests are
+ * recorded as codes too, so autopilot runs replay without the pilot.
+ */
+export function tick(s: RunState, codes: readonly number[], pilot?: (s: RunState, row: number) => number): void {
+  if (s.phase !== 'run') return;
+  for (const code of codes) {
+    s.log.push(s.tick, code);
+    applyInput(s, code);
+  }
+  const rec = pilot
+    ? (st: RunState, row: number) => {
+        const max = maxLanesFor(st, row);
+        const v = Math.max(-max, Math.min(max, pilot(st, row)));
+        st.log.push(st.tick, PILOT + v);
+        return v;
+      }
+    : undefined;
+  step(s, TICK, s.held, rec);
+  s.tick++;
+}
+
+/** The input log is well formed: [tick, code] pairs, ticks in order and in range, known codes. */
+function validLog(log: unknown): log is number[] {
+  if (!Array.isArray(log) || log.length % 2 !== 0 || log.length > MAX_LOG) return false;
+  let last = 0;
+  for (let i = 0; i < log.length; i += 2) {
+    const t: unknown = log[i];
+    const code: unknown = log[i + 1];
+    if (typeof t !== 'number' || !Number.isInteger(t) || t < last || t >= MAX_TICKS) return false;
+    if (typeof code !== 'number' || !Number.isInteger(code) || code < 0 || code > PILOT + 2) return false;
+    last = t;
+  }
+  return true;
+}
+
+/** Rerun a whole run from its input log (server side). null if the log is malformed or the run never ends. */
+export function replay(course: Course, parSeconds: number, log: unknown): RunState | null {
+  if (!validLog(log)) return null;
+  const s = newRun(course, parSeconds);
+  startRun(s);
+  let i = 0;
+  const codes: number[] = [];
+  while (s.phase === 'run' && s.tick < MAX_TICKS) {
+    codes.length = 0;
+    while (i < log.length && log[i] === s.tick) {
+      codes.push(log[i + 1] ?? 0);
+      i += 2;
+    }
+    tick(s, codes);
+    s.events.length = 0;
+  }
+  return s.phase === 'run' ? null : s;
+}
+
 /**
  * Par time: the whole track at cruise speed, no Tuck/Brake, no cells (spec §10). Computed by the same speed model as the
  * live run, at a fixed 60 Hz step. Never hand-written.
@@ -349,29 +441,6 @@ export function computePar(): number {
     t += dt;
   }
   return Math.round(t * 10) / 10;
-}
-
-/**
- * Highest score this track allows (server-side cheat bound, spec §13): every row, every gate at the ×3 cap, every
- * Collect, every Ramp at the best rampBonus, a break on every row of every breakCrash pickup, finish at top speed.
- */
-export function maxScore(course: Course, parSeconds: number): number {
-  let collects = 0;
-  let ramps = 0;
-  for (let i = 0; i < course.cells.length; i++) {
-    if (course.cells[i] === Cell.Collect) collects++;
-    if (course.cells[i] === Cell.Ramp) ramps++;
-  }
-  let gates = 0;
-  for (let i = 1; i <= course.gateRows.size; i++) gates += 30 * Math.min(3, i);
-  let breaks = 0;
-  for (const p of course.pickups) {
-    const v = vehicle(p.vehicle);
-    if (v.breakCrash) breaks += v.durationRows * Math.max(1, v.lanesPerRow) * 5;
-  }
-  // no run can be faster than the whole track at the absolute speed cap
-  const fastest = FINISH_ROW / SPEED_CAP;
-  return FINISH_ROW + gates + collects * 10 + ramps * 40 + breaks + Math.ceil((TIME_POINTS * parSeconds) / fastest);
 }
 
 /** A run state placed at an arbitrary row/lane, already running (for probes and tests). */

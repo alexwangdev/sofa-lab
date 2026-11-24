@@ -3,12 +3,13 @@ import { memo, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import type { PointerEvent as RPointerEvent, Ref } from 'react';
 import { BIOMES } from '../shared/biomes.ts';
 import { segmentOf } from '../shared/grid.ts';
-import { newRun, queueSteer, startRun, step } from '../shared/sim.ts';
+import { IN, TICK, heldCodes, newRun, startRun, tick } from '../shared/sim.ts';
 import { decide } from '../shared/autopilot.ts';
 import type { GameEvent, RunState } from '../shared/sim.ts';
 import { vehicle } from '../shared/vehicles.ts';
 import type { Course } from '../shared/types.ts';
 import { drawFrame, newFx, setDrawDistance } from './render.ts';
+import { readyToStart } from './atlas.ts';
 import { installSfx, sfxEvent, sfxFrame, sfxQuiet } from './sfx.ts';
 import { musicFrame, musicQuiet } from './music.ts';
 
@@ -32,6 +33,8 @@ export type CanvasHandle = {
   steer: (dir: -1 | 1) => void;
   hold: (key: 'fast' | 'brake', on: boolean) => void;
   start: () => void;
+  /** Pause / resume a run in progress. */
+  setPaused: (on: boolean) => void;
 };
 
 type Props = {
@@ -162,6 +165,14 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
   const drag = useRef<{ id: number; x0: number; y0: number; lanes: number; moved: boolean } | null>(null);
   const [size, setSize] = useState({ w: 360, h: 480 });
   const [tier, setTier] = useState(0);
+  /** Lane inputs waiting for the next fixed tick (IN.left / IN.right). */
+  const inputQ = useRef<number[]>([]);
+  const pausedRef = useRef(false);
+  const [paused, setPausedState] = useState(false);
+  const [running, setRunning] = useState(false);
+  const runningRef = useRef(false);
+  /** Retry: start by itself as soon as the first biome's models are in. */
+  const autoStartRef = useRef(false);
   const cb = useRef({ onTick, onEnd, onRetry });
   useEffect(() => {
     cb.current = { onTick, onEnd, onRetry };
@@ -171,7 +182,10 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
     const s = newRun(course, parSeconds);
     runRef.current = s;
     fxRef.current = newFx(s.lane);
-    if (autoStart) startRun(s);
+    inputQ.current.length = 0;
+    pausedRef.current = false;
+    setPausedState(false);
+    autoStartRef.current = autoStart;
     cb.current.onTick(s);
     if (import.meta.env.DEV)
       void import('./devHooks.ts').then((d) => {
@@ -183,11 +197,24 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
   const doStart = () => {
     const s = runRef.current;
     if (s.phase === 'ready') {
+      if (!readyToStart(s.course.biomes[0])) return; // first biome still downloading (the overlay says so)
       startRun(s);
       cb.current.onTick(s);
     } else if (s.phase !== 'run') cb.current.onRetry();
   };
-  const steer = (dir: -1 | 1) => queueSteer(runRef.current, dir);
+  // inputs go through the next fixed tick so they land in the input log the server replays
+  const steer = (dir: -1 | 1) => {
+    if (runRef.current.phase === 'run' && !pausedRef.current && !pilotRef.current) inputQ.current.push(dir < 0 ? IN.left : IN.right);
+  };
+  const setPaused = (on: boolean) => {
+    const want = on && runRef.current.phase === 'run';
+    if (want === pausedRef.current) return;
+    pausedRef.current = want;
+    setPausedState(want);
+    inputQ.current.length = 0;
+    keySteer.current = null;
+    Object.assign(held.current, { fast: false, brake: false, dragFast: false, dragBrake: false });
+  };
 
   useImperativeHandle(ref, () => ({
     steer,
@@ -195,6 +222,7 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
       held.current[key] = on;
     },
     start: doStart,
+    setPaused,
   }));
 
   // canvas 360–480 px wide, ~3:2 tall, bounded by the viewport
@@ -226,34 +254,63 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
     let raf = 0;
     let last = performance.now();
     let tickAt = 0;
+    /** Sim time not yet run as fixed ticks, and the position before the last tick (to draw between ticks). */
+    let acc = 0;
+    let prevPos = runRef.current.pos;
     const frame = (now: number) => {
       const dt = Math.min(0.05, (now - last) / 1000);
       last = now;
       const s = runRef.current;
       const fx = fxRef.current;
-      const ks = keySteer.current;
-      if (ks && fx.clock >= ks.next) {
-        queueSteer(s, ks.dir);
-        ks.next = fx.clock + REPEAT_EVERY;
-      }
       const before = s.phase;
       const h = held.current;
-      // dev-only: automated playtests can freeze the sim (window.__pause) while they inspect a frame
-      const paused = import.meta.env.DEV && (window as unknown as { __pause?: boolean }).__pause === true;
       const pilot = pilotRef.current;
-      if (pilot && s.phase === 'ready') {
+      if ((pilot || autoStartRef.current) && s.phase === 'ready' && readyToStart(s.course.biomes[0])) {
+        autoStartRef.current = false;
         startRun(s);
         cb.current.onTick(s);
       }
-      if (!paused) step(s, dt, pilot ? { fast: true, brake: false } : { fast: h.fast || h.dragFast, brake: h.brake || h.dragBrake }, pilot ? decide : undefined);
+      if (pausedRef.current && s.phase !== 'run') setPaused(false); // a run that ended cannot stay paused
+      // dev-only: automated playtests can freeze the sim (window.__pause) while they inspect a frame
+      const frozen = pausedRef.current || (import.meta.env.DEV && (window as unknown as { __pause?: boolean }).__pause === true);
+      if (s.phase === 'run' && !frozen) {
+        const ks = keySteer.current;
+        if (ks && fx.clock >= ks.next) {
+          steer(ks.dir);
+          ks.next = fx.clock + REPEAT_EVERY;
+        }
+        acc += dt;
+        while (acc >= TICK && s.phase === 'run') {
+          acc -= TICK;
+          prevPos = s.pos;
+          const fast = pilot || h.fast || h.dragFast;
+          const brake = !pilot && (h.brake || h.dragBrake);
+          const codes = [...inputQ.current, ...heldCodes(s, fast, brake)];
+          inputQ.current.length = 0;
+          tick(s, codes, pilot ? decide : undefined);
+        }
+      } else {
+        acc = 0;
+        prevPos = s.pos;
+        inputQ.current.length = 0;
+      }
+      if ((s.phase === 'run') !== runningRef.current) {
+        runningRef.current = s.phase === 'run';
+        setRunning(runningRef.current);
+      }
       for (const e of s.events) {
         applyEvent(fx, s, e);
         sfxEvent(s, e);
       }
       s.events.length = 0;
-      sfxFrame(s, dt);
-      musicFrame(s, dt);
-      stepFx(fx, s, dt);
+      if (pausedRef.current) {
+        sfxQuiet();
+        musicQuiet();
+      } else {
+        sfxFrame(s, dt);
+        musicFrame(s, dt);
+        stepFx(fx, s, dt);
+      }
       if (s.phase !== before && (s.phase === 'crash' || s.phase === 'finish')) cb.current.onEnd(s);
       if (fx.clock >= tickAt) {
         tickAt = fx.clock + 0.1;
@@ -261,7 +318,11 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
       }
       ctx.setTransform(k, 0, 0, k, 0, 0);
       const t0 = performance.now();
+      // draw between the last two ticks so motion stays smooth at any refresh rate
+      const real = s.pos;
+      if (s.phase === 'run') s.pos = prevPos + (real - prevPos) * Math.min(1, acc / TICK);
       drawFrame(ctx, s, fx, size.w, size.h);
+      s.pos = real;
       const spent = performance.now() - t0;
       ema = ema === 0 ? spent : ema * 0.95 + spent * 0.05;
       slowFrames = ema > SLOW_MS ? slowFrames + 1 : 0;
@@ -284,9 +345,17 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
       if (e.target instanceof HTMLElement && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT')) return;
       if (isL(e.key) || isR(e.key) || isUp(e.key) || isDown(e.key) || e.key === ' ') e.preventDefault();
       if (e.repeat) return;
+      if (e.key === 'p' || e.key === 'P' || e.key === 'Escape') {
+        setPaused(!pausedRef.current);
+        return;
+      }
+      if (pausedRef.current) {
+        if (e.key === ' ' || e.key === 'Enter') setPaused(false);
+        return;
+      }
       if (isL(e.key) || isR(e.key)) {
         const dir = isL(e.key) ? -1 : 1;
-        queueSteer(runRef.current, dir);
+        steer(dir);
         keySteer.current = { dir, next: fxRef.current.clock + REPEAT_DELAY };
       } else if (isUp(e.key)) held.current.fast = true;
       else if (isDown(e.key)) held.current.brake = true;
@@ -300,13 +369,19 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
       if (isUp(e.key)) held.current.fast = false;
       if (isDown(e.key)) held.current.brake = false;
     };
+    // leaving the page (tab switch, app switch, devtools, a phone call) pauses a run in progress
     const blur = () => {
       keySteer.current = null;
       Object.assign(held.current, { fast: false, brake: false, dragFast: false, dragBrake: false });
+      if (!pilotRef.current) setPaused(true);
+    };
+    const vis = () => {
+      if (document.visibilityState === 'hidden') blur();
     };
     window.addEventListener('keydown', kd);
     window.addEventListener('keyup', ku);
     window.addEventListener('blur', blur);
+    document.addEventListener('visibilitychange', vis);
     return () => {
       cancelAnimationFrame(raf);
       sfxQuiet();
@@ -314,11 +389,13 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
       window.removeEventListener('keydown', kd);
       window.removeEventListener('keyup', ku);
       window.removeEventListener('blur', blur);
+      document.removeEventListener('visibilitychange', vis);
     };
-    // doStart only touches refs, so capturing it here is safe
+    // doStart, steer and setPaused only touch refs and state setters, so capturing them here is safe
   }, [size, tier]);
 
   const onDown = (e: RPointerEvent<HTMLCanvasElement>) => {
+    if (pausedRef.current) return;
     if (runRef.current.phase !== 'run') {
       doStart();
       return;
@@ -362,16 +439,33 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ course, parSeco
 
   return (
     <div ref={wrapRef} className="w-full flex justify-center">
-      <canvas
-        ref={canvasRef}
-        style={{ width: size.w, height: size.h, touchAction: 'none' }}
-        className="block rounded-xl shadow-lg select-none"
-        aria-label="Track. Arrow keys or drag to change lanes."
-        onPointerDown={onDown}
-        onPointerMove={onMove}
-        onPointerUp={onUp}
-        onPointerCancel={onUp}
-      />
+      <div className="relative" style={{ width: size.w, height: size.h }}>
+        <canvas
+          ref={canvasRef}
+          style={{ width: size.w, height: size.h, touchAction: 'none' }}
+          className="block rounded-xl shadow-lg select-none"
+          aria-label="Track. Arrow keys or drag to change lanes. P to pause."
+          onPointerDown={onDown}
+          onPointerMove={onMove}
+          onPointerUp={onUp}
+          onPointerCancel={onUp}
+        />
+        {running && !paused && !autoPilot && (
+          <button className="absolute top-2 right-2 rounded-lg bg-slate-900/70 px-3 py-1.5 text-sm font-bold text-white" aria-label="Pause" title="Pause (P)" onClick={() => setPaused(true)}>
+            ❚❚
+          </button>
+        )}
+        {paused && (
+          // the track is hidden while paused, so a pause is not free time to study the road ahead
+          <div className="absolute inset-0 rounded-xl bg-slate-950/90 flex flex-col items-center justify-center gap-3">
+            <p className="text-2xl font-extrabold">Paused</p>
+            <button className="btn btn-primary text-base px-6" autoFocus onClick={() => setPaused(false)}>
+              Resume
+            </button>
+            <p className="text-xs text-slate-400">P · Esc · Space</p>
+          </div>
+        )}
+      </div>
     </div>
   );
 });

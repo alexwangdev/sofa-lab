@@ -89,9 +89,10 @@ export type TodayResponse = {
   username: string | null;
 };
 
-export type RunBody = { score: number; distance: number; gates: number; finished: boolean; seedCheck: number; time: number };
+/** A finished or crashed run: the track checksum, the claimed score, and the input log the server replays (sim.ts). */
+export type RunBody = { score: number; seedCheck: number; inputs: number[] };
 
-export type RunResponse = { best: number; rank: number | null; streak: number; improved: boolean };
+export type RunResponse = { score: number; best: number; rank: number | null; streak: number; improved: boolean };
 
 export type LeaderboardEntry = { rank: number; username: string; score: number };
 export type LeaderboardResponse = { date: string; top: LeaderboardEntry[]; me: { rank: number; best: number } | null; total: number };

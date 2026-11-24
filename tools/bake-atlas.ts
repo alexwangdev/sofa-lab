@@ -3,12 +3,12 @@
  *
  * For each biome: build every model in the catalog (src/client/catalog.ts), rasterise every view it can be seen from
  * with the same pure-JS rasteriser the game uses (src/client/voxel.ts), shelf-pack them into ≤2048×2048 pages and
- * write  src/client/public/atlas/<biome>.json  +  <biome>-<n>.png.  No canvas library: a tiny PNG encoder below.
+ * write  src/client/public/atlas/<biome>.json  +  <biome>-<n>.webp  (encoded with sharp, a build-time dev dependency).
  */
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { deflateSync } from 'node:zlib';
+import sharp from 'sharp';
 import { BIOME_IDS } from '../src/shared/types.ts';
 import type { BiomeId } from '../src/shared/types.ts';
 import { biomeCatalog } from '../src/client/catalog.ts';
@@ -19,80 +19,14 @@ const OUT = resolve(dirname(fileURLToPath(import.meta.url)), '../src/client/publ
 const PAGE = 2048;
 const GAP = 2;
 
-// ---------- PNG ----------
+// ---------- WebP ----------
 
-const CRC = (() => {
-  const t = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c >>> 0;
-  }
-  return t;
-})();
-function crc32(buf: Uint8Array): number {
-  let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = (CRC[(c ^ (buf[i] ?? 0)) & 0xff] ?? 0) ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
-function chunk(type: string, data: Uint8Array): Buffer {
-  const head = Buffer.alloc(8);
-  head.writeUInt32BE(data.length, 0);
-  head.write(type, 4, 'ascii');
-  const body = Buffer.concat([head.subarray(4), Buffer.from(data)]);
-  const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(body), 0);
-  return Buffer.concat([head.subarray(0, 4), body, crc]);
-}
-/** RGBA8 → PNG, choosing the best of the five scanline filters per row (smaller files for flat voxel art). */
-function encodePng(w: number, h: number, rgba: Uint8Array): Buffer {
-  const stride = w * 4;
-  const raw = Buffer.alloc((stride + 1) * h);
-  const cand = [Buffer.alloc(stride), Buffer.alloc(stride), Buffer.alloc(stride), Buffer.alloc(stride), Buffer.alloc(stride)];
-  for (let y = 0; y < h; y++) {
-    const row = y * stride;
-    const prev = (y - 1) * stride;
-    let best = 0;
-    let bestSum = Infinity;
-    for (let f = 0; f < 5; f++) {
-      const out = cand[f] as Buffer;
-      let sum = 0;
-      for (let i = 0; i < stride; i++) {
-        const x = rgba[row + i] ?? 0;
-        const a = i >= 4 ? (rgba[row + i - 4] ?? 0) : 0;
-        const b = y > 0 ? (rgba[prev + i] ?? 0) : 0;
-        const c = y > 0 && i >= 4 ? (rgba[prev + i - 4] ?? 0) : 0;
-        let v: number;
-        if (f === 0) v = x;
-        else if (f === 1) v = x - a;
-        else if (f === 2) v = x - b;
-        else if (f === 3) v = x - ((a + b) >> 1);
-        else {
-          const p = a + b - c;
-          const pa = Math.abs(p - a);
-          const pb = Math.abs(p - b);
-          const pc = Math.abs(p - c);
-          v = x - (pa <= pb && pa <= pc ? a : pb <= pc ? b : c);
-        }
-        v &= 0xff;
-        out[i] = v;
-        sum += v < 128 ? v : 256 - v;
-      }
-      if (sum < bestSum) {
-        bestSum = sum;
-        best = f;
-      }
-    }
-    raw[y * (stride + 1)] = best;
-    (cand[best] as Buffer).copy(raw, y * (stride + 1) + 1);
-  }
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(w, 0);
-  ihdr.writeUInt32BE(h, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 6; // RGBA
-  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), chunk('IDAT', deflateSync(raw, { level: 9 })), chunk('IEND', new Uint8Array(0))]);
-}
+/**
+ * RGBA8 → WebP: lossy colour at quality 85 with lossless alpha (clean sprite edges). About half the size of the old
+ * optimised PNGs, and no visible difference at the size sprites are drawn (checked side by side at 3× zoom).
+ */
+const WEBP = { quality: 85, alphaQuality: 100, effort: 4 } as const; // effort 6 is ~1 % smaller and 10× slower
+const encodeWebp = (w: number, h: number, rgba: Uint8Array): Promise<Buffer> => sharp(rgba, { raw: { width: w, height: h, channels: 4 } }).webp(WEBP).toBuffer();
 
 // ---------- packing ----------
 
@@ -131,7 +65,7 @@ function pack(sprites: Sprite[]): number[] {
 
 // ---------- main ----------
 
-function bakeBiome(biome: BiomeId): { bytes: number; views: number; pages: number } {
+async function bakeBiome(biome: BiomeId): Promise<{ bytes: number; views: number; pages: number }> {
   const sprites: Sprite[] = [];
   const lifts: Record<string, number> = {};
   for (const item of biomeCatalog(biome)) {
@@ -152,18 +86,18 @@ function bakeBiome(biome: BiomeId): { bytes: number; views: number; pages: numbe
   // trim page width to what is used
   const files: string[] = [];
   let bytes = 0;
-  pages.forEach((p, i) => {
+  for (const [i, p] of pages.entries()) {
     let maxX = 1;
     for (const s of sprites) if (s.page === i) maxX = Math.max(maxX, s.x + s.r.w);
     const w = maxX;
     const data = new Uint8Array(w * p.h * 4);
     for (let y = 0; y < p.h; y++) data.set(p.data.subarray(y * p.w * 4, (y * p.w + w) * 4), y * w * 4);
-    const png = encodePng(w, p.h, data);
-    const name = `${biome}-${i}.png`;
-    writeFileSync(resolve(OUT, name), png);
+    const img = await encodeWebp(w, p.h, data);
+    const name = `${biome}-${i}.webp`;
+    writeFileSync(resolve(OUT, name), img);
     files.push(name);
-    bytes += png.length;
-  });
+    bytes += img.length;
+  }
   const items: Record<string, { lift: number; views: number[][] }> = {};
   for (const s of sprites) {
     const it = (items[s.key] ??= { lift: lifts[s.key] ?? 0, views: [] });
@@ -179,7 +113,7 @@ rmSync(OUT, { recursive: true, force: true });
 mkdirSync(OUT, { recursive: true });
 let total = 0;
 for (const b of BIOME_IDS) {
-  const r = bakeBiome(b);
+  const r = await bakeBiome(b);
   total += r.bytes;
   console.log(`atlas ${b.padEnd(9)} ${String(r.views).padStart(5)} views  ${r.pages} page(s)  ${(r.bytes / 1024).toFixed(0)} KB`);
 }

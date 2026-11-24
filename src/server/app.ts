@@ -5,10 +5,9 @@
 import { Hono } from 'hono';
 import type { Context as HonoContext } from 'hono';
 import { BIOMES } from '../shared/biomes.ts';
-import { FINISH_ROW, ROWS } from '../shared/grid.ts';
 import { isDateString, prevDate } from '../shared/rng.ts';
-import { maxScore } from '../shared/sim.ts';
-import type { ErrorResponse, LeaderboardEntry, LeaderboardResponse, RunBody, RunResponse, TodayResponse } from '../shared/types.ts';
+import { MAX_LOG, replay, score as scoreOf } from '../shared/sim.ts';
+import type { ErrorResponse, LeaderboardEntry, LeaderboardResponse, RunResponse, TodayResponse } from '../shared/types.ts';
 import { courseFor, getPuzzle } from './daily.ts';
 import type { Puzzle } from './daily.ts';
 import type { Env, RedisLike } from './ports.ts';
@@ -108,22 +107,21 @@ export function createApp(env: Env): Hono {
     const { userId, date } = ctx;
     const b = await readBody(c);
     if (!b) return bad(c, 'body must be JSON');
-    const { score, distance, gates, finished, seedCheck, time } = b;
+    const { score, seedCheck, inputs } = b;
     if (!isInt(score) || score < 0) return bad(c, 'score must be an int ≥ 0');
-    if (!isInt(distance) || distance < 0 || distance > ROWS) return bad(c, `distance must be an int in [0, ${ROWS}]`);
-    if (!isInt(gates) || gates < 0) return bad(c, 'gates must be an int ≥ 0');
-    if (typeof finished !== 'boolean') return bad(c, 'finished must be a boolean');
     if (!isInt(seedCheck)) return bad(c, 'seedCheck must be an int');
-    if (typeof time !== 'number' || !Number.isFinite(time) || time < 0) return bad(c, 'time must be a number ≥ 0');
+    if (!Array.isArray(inputs) || inputs.length > MAX_LOG) return bad(c, `inputs must be an array of at most ${MAX_LOG} numbers`);
     if (!userId) return bad(c, 'log in to post a score', 401);
 
     const puzzle = await getPuzzle(redis, date);
     const course = courseFor(date, puzzle);
     if (seedCheck !== course.checksum) return bad(c, 'track mismatch, reload the post', 409);
-    if (gates > course.gateRows.size) return bad(c, 'more gates than the track has');
-    if (finished && distance < FINISH_ROW) return bad(c, 'finished runs cover the whole track');
-    if (score > maxScore(course, puzzle.parSeconds)) return bad(c, 'score is not possible on this track');
-    const body: RunBody = { score, distance, gates, finished, seedCheck, time };
+    // the server never trusts the client's numbers: it reruns the run from its inputs and scores that
+    const run = replay(course, puzzle.parSeconds, inputs);
+    if (!run) return bad(c, 'inputs are not a valid run');
+    const verified = scoreOf(run).total;
+    if (verified !== score) return bad(c, 'score does not match the replayed run');
+    const body = { score: verified, finished: run.phase === 'finish' };
 
     const username = (await ctx.username()) ?? 'unknown';
     const prev = parseUser(await redis.get(kUser(userId, date)));
@@ -158,7 +156,7 @@ export function createApp(env: Env): Hono {
     // Journeys: one event per finished run, score bucket only; crashes send nothing
     if (body.finished) console.log(`[journey] finish bucket=${scoreBucket(body.score)}`);
 
-    return c.json<RunResponse>({ best: rec.best, rank, streak, improved });
+    return c.json<RunResponse>({ score: verified, best: rec.best, rank, streak, improved });
   });
 
   api.get('/leaderboard', async (c) => {
