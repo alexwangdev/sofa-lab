@@ -68,9 +68,11 @@ function pack(sprites: Sprite[]): number[] {
 async function bakeBiome(biome: BiomeId): Promise<{ bytes: number; views: number; pages: number }> {
   const sprites: Sprite[] = [];
   const lifts: Record<string, number> = {};
+  const fits: Record<string, number> = {};
   for (const item of biomeCatalog(biome)) {
     const m = item.entry.model;
     lifts[item.entry.key] = m.lift;
+    fits[item.entry.key] = Math.round(item.entry.fit * 1000) / 1000;
     for (const v of item.views) sprites.push({ key: item.entry.key, view: v, r: rasterView(m, v[0], v[1], v[2]), page: 0, x: 0, y: 0 });
   }
   const heights = pack(sprites);
@@ -98,9 +100,9 @@ async function bakeBiome(biome: BiomeId): Promise<{ bytes: number; views: number
     files.push(name);
     bytes += img.length;
   }
-  const items: Record<string, { lift: number; views: number[][] }> = {};
+  const items: Record<string, { lift: number; fit: number; views: number[][] }> = {};
   for (const s of sprites) {
-    const it = (items[s.key] ??= { lift: lifts[s.key] ?? 0, views: [] });
+    const it = (items[s.key] ??= { lift: lifts[s.key] ?? 0, fit: fits[s.key] ?? 1, views: [] });
     it.views.push([s.view[0], s.view[1], s.view[2], s.page, s.x, s.y, s.r.w, s.r.h, Math.round(s.r.ax * 100) / 100, Math.round(s.r.ay * 100) / 100]);
   }
   const json = JSON.stringify({ biome, pages: files, items });

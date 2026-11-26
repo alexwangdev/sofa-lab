@@ -26,10 +26,14 @@ const TRACK_ANGLES: readonly Angle[] = (() => {
   return out;
 })();
 
-/** Angles the runner is seen from (ZP rows ahead, a lane or two off-centre, leaning into lane changes). */
+/**
+ * Angles the runner is drawn at: straight ahead (it always faces down the track; lane changes are a 2D lean), a bit
+ * higher and lower for ramp jumps, and side-on around 80° for the crashed, spun-round pose.
+ */
 const RUNNER_ANGLES: readonly Angle[] = (() => {
   const out: Angle[] = [];
-  for (let dx = -2.5; dx <= 2.5; dx += 0.5) for (const lean of [-0.4, 0, 0.4]) out.push([-Math.atan2(dx, ZP) + lean, Math.atan2(CAM_H, ZP)]);
+  for (const up of [-1, 0, 1, 2]) out.push([0, Math.atan2(CAM_H - up, ZP)]);
+  for (let yaw = 0.9; yaw <= 1.9; yaw += 0.17) out.push([yaw, Math.atan2(CAM_H, ZP)]);
   return out;
 })();
 

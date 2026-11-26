@@ -48,7 +48,7 @@ Performance:
 - **Per frame**: sparse off-track scenery (the column next to the track stays empty), one plain strip per side per row, lane grid lines as one stroke per row, cached colours and fill strings, a cached sky. At most ~6 ms of on-demand baking a frame; otherwise the nearest baked angle is shown and the right one bakes in idle time.
 - **Ground in one pass:** side strips and the lane base are long polygons (one per colour run). All special and checker cells are batched by colour, the grid and track edges are one stroke per colour, and boost arrows, slow ripples and hazard brackets are batched too. This cut ~500 fills and strokes per frame to a few dozen; per-row ground drawing had been most of the frame. The checker is only drawn within 22 rows.
 - **Fog is one gradient overlay** over the band beyond 14 rows, drawn right after the far rows. Before, every sprite angle had its own fog-tinted copy, which created and uploaded new canvases all the time and caused stutter.
-- **Runner angles cross-fade:** the runner blends the two nearest pre-rendered yaw angles instead of snapping between 10° steps, so lane changes no longer pop.
+- **Runner lean:** the runner keeps one straight-ahead view and leans in 2D while changing lanes, so nothing pops between 10° angle steps and no two angles are blended (see "Models stay inside their cell").
 - **Atlas pages are decoded and uploaded to the GPU in idle time** right after download, instead of on the first frame that uses them. The canvas component is memoised, so the 10 Hz HUD updates do not re-render it.
 - Dev profiler: `window.__profile()` plays a fresh run frame by frame and reports sim and draw times (p95, p99, worst frames). `window.__layers` switches ground, cells, grid, marks, objects, fog and sky on or off to measure each one. All dev hooks live in `src/client/devHooks.ts` and are not in the production bundle.
 - **Adaptive quality**: if drawing stays above 11 ms, the pixel ratio and draw distance step down (2×/46 rows → 1.5×/40 → 1×/32), and step back up after it stays under 4 ms.
@@ -118,6 +118,13 @@ The music is composed at run time as a 4-bar loop for each biome. Each biome has
   - On a crash or finish, the music fades out.
 - **Scheduling**: notes are queued about 0.3 s ahead on the audio clock. A 50 ms timer tops the queue up as well as the render loop, so slow or throttled frames cause no gaps.
 - **Levels**: master 0.9, then a compressor; music bus 0.9. Measured during a run, music averages about −29 dB RMS against about −25 dB for the whole mix. Before this it was about −41 dB under a −32 dB mix, which is why it could not be heard.
+
+## Models stay inside their cell
+
+- Every model gets a fit scale (`Entry.fit` in `voxel.ts`), measured from its voxels at bake time and stored in the atlas next to `lift`. Nothing is drawn wider than one cell, so no obstacle seems to block the next lane.
+- Track objects are also at most one cell long. Vehicles may be up to 2.5 cells long.
+- Examples: the helicopter is drawn at 0.4× (its rotor was 2.5 cells wide), the hot-air balloon at 0.5×, the elephant at 0.55×, and most crash obstacles at 0.86–0.92×.
+- The runner always uses its single straight-ahead view, so it never looks turned in the outer lanes. A lane change shows as a 2D lean of that one sprite around its ground point, up to about 14°. The old way blended two pre-rendered angles and left a visible double image. The runner now needs only a few views (straight ahead at a few heights, plus side-on for the crash pose), so the atlas is 4.91 MB.
 
 ## Endless mode
 

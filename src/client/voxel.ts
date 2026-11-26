@@ -333,7 +333,7 @@ export function bake(m: Model, yaw: number, pitch: number, k: number): Baked {
 
 // ---------- cache: stream in what is coming, drop what is behind ----------
 
-export const YAW_STEP = (10 * Math.PI) / 180;
+const YAW_STEP = (10 * Math.PI) / 180;
 const PITCH_STEP = (8 * Math.PI) / 180;
 /** Max canvas pixels per voxel (near views, gallery thumbnails). */
 const MAX_K = 4;
@@ -359,6 +359,7 @@ export class Entry {
   complete = false;
   /** Set from the atlas so drawing never has to build the model just to read it. */
   liftCells: number | null = null;
+  fitScale: number | null = null;
   private readonly build: () => Model;
   private built: Model | null = null;
   constructor(key: string, tag: string, build: () => Model) {
@@ -373,6 +374,38 @@ export class Entry {
   get lift(): number {
     return this.liftCells ?? this.model.lift;
   }
+  /**
+   * Draw scale that keeps the model inside its footprint: at most one cell wide (so nothing seems to block the next
+   * lane), and at most one cell long for track objects / FIT_VEHICLE_DEPTH cells for vehicles. 1 when it already fits.
+   */
+  get fit(): number {
+    this.fitScale ??= fitFor(this.model, this.key.startsWith('v:') ? FIT_VEHICLE_DEPTH : 1);
+    return this.fitScale;
+  }
+}
+
+/** Longest a vehicle may be along the track, in cells (sleds and trains are long; a cell is the lane's width). */
+const FIT_VEHICLE_DEPTH = 2.5;
+/** Filled extent of a model across (x) and along (z) the track, in cells. */
+export function footprint(m: Model): { w: number; d: number } {
+  let x0 = Infinity;
+  let x1 = -Infinity;
+  let z0 = Infinity;
+  let z1 = -Infinity;
+  for (let y = 0; y < m.h; y++)
+    for (let z = 0; z < m.d; z++)
+      for (let x = 0; x < m.w; x++)
+        if (m.cells[(y * m.d + z) * m.w + x]) {
+          if (x < x0) x0 = x;
+          if (x > x1) x1 = x;
+          if (z < z0) z0 = z;
+          if (z > z1) z1 = z;
+        }
+  return x1 < x0 ? { w: 0, d: 0 } : { w: (x1 - x0 + 1) / VPC, d: (z1 - z0 + 1) / VPC };
+}
+export function fitFor(m: Model, maxDepth: number): number {
+  const f = footprint(m);
+  return Math.min(1, f.w > 0 ? 1 / f.w : 1, f.d > 0 ? maxDepth / f.d : 1);
 }
 const cache = new Map<string, Entry>();
 export const viewKey = (yi: number, pi: number, k: number): number => ((yi + 64) * 64 + pi) * 8 + k;

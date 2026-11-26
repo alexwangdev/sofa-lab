@@ -10,7 +10,7 @@ import { viewKey } from './voxel.ts';
 
 /** [yi, pi, k, page, x, y, w, h, ax, ay] */
 type AtlasView = [number, number, number, number, number, number, number, number, number, number];
-type AtlasMeta = { biome: BiomeId; pages: string[]; items: Record<string, { lift: number; views: AtlasView[] }> };
+type AtlasMeta = { biome: BiomeId; pages: string[]; items: Record<string, { lift: number; fit?: number; views: AtlasView[] }> };
 
 const loads = new Map<BiomeId, Promise<boolean>>();
 
@@ -111,6 +111,7 @@ export function loadBiomeAtlas(biome: BiomeId): Promise<boolean> {
       const e = byKey.get(key);
       if (!e || !e.alive) continue;
       e.liftCells = item.lift;
+      if (item.fit !== undefined) e.fitScale = item.fit;
       for (const [yi, pi, k, page, x, y, w, h, ax, ay] of item.views) {
         const img = pages[page];
         if (img) e.views.set(viewKey(yi, pi, k), { img, sx: x, sy: y, w, h, ax, ay, k });

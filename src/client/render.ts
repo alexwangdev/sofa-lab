@@ -14,7 +14,7 @@ import type { RunState } from '../shared/sim.ts';
 import { Cell } from '../shared/types.ts';
 import type { BiomeId, Course } from '../shared/types.ts';
 import { collectModel, crashModel, pickupPadModel, poleModel, rampModel, slowModel, vehicleModel } from './models.ts';
-import { VPC, YAW_STEP, beginFrame, evict, preloadViews, rgb, viewOf } from './voxel.ts';
+import { VPC, beginFrame, evict, preloadViews, rgb, viewOf } from './voxel.ts';
 import type { RGB } from './voxel.ts';
 import { forgetBiomeAtlas, loadBiomeAtlas } from './atlas.ts';
 import { CAM_H, ZP, biomeCatalog } from './catalog.ts';
@@ -427,8 +427,11 @@ function fillFor(col: RGB, c: Cam, f: number): string {
 
 /* ---------- billboards ---------- */
 
-/** `smooth`: blend the two nearest pre-rendered yaw angles instead of snapping (the runner, while leaning). */
-type BillboardOpts = { scale?: number; spin?: number; shadow?: number; alpha?: number; smooth?: boolean };
+/**
+ * `facing`: a fixed yaw (radians, 0 = down the track) instead of the angle the camera sees the object from.
+ * `tilt`: a 2D lean (radians, + = top to the right) of the sprite around its ground point.
+ */
+type BillboardOpts = { scale?: number; spin?: number; facing?: number; tilt?: number; shadow?: number; alpha?: number };
 
 /**
  * Draw a baked voxel model standing at world (x, y, z): pick the view nearest to the angle the camera sees it from,
@@ -437,15 +440,12 @@ type BillboardOpts = { scale?: number; spin?: number; shadow?: number; alpha?: n
 function billboard(ctx: CanvasRenderingContext2D, c: Cam, e: Entry, x: number, y: number, z: number, opt: BillboardOpts = {}): void {
   const dz = z - c.z;
   if (dz < NEAR + 0.2) return;
-  const scale = opt.scale ?? 1;
+  const scale = (opt.scale ?? 1) * e.fit;
   const lift = e.lift * scale;
-  const yaw = -Math.atan2(x - c.x, dz) + (opt.spin ?? 0);
+  // facing: seen from the camera's angle, unless the caller fixes it (the runner always faces down the track)
+  const yaw = (opt.facing ?? -Math.atan2(x - c.x, dz)) + (opt.spin ?? 0);
   const pitch = Math.atan2(c.y - (y + lift), dz);
-  // smooth: the two neighbouring yaw buckets and how far we are between them
-  const yf = yaw / YAW_STEP;
-  const t = opt.smooth ? yf - Math.floor(yf) : 0;
-  const v = viewOf(e, opt.smooth ? Math.floor(yf) * YAW_STEP : yaw, pitch);
-  const v2 = t > 0.04 ? viewOf(e, (Math.floor(yf) + 1) * YAW_STEP, pitch) : null;
+  const v = viewOf(e, yaw, pitch);
   const k = ((c.F / dz) * scale) / (VPC * v.k);
   if (opt.shadow) {
     const [gx, gy] = proj(c, x, y, z);
@@ -462,13 +462,13 @@ function billboard(ctx: CanvasRenderingContext2D, c: Cam, e: Entry, x: number, y
   const h = v.h * k;
   if (dx > c.w || dx + w < 0 || dy > c.h || dy + h < 0) return;
   if (opt.alpha !== undefined) ctx.globalAlpha = opt.alpha;
-  ctx.drawImage(v.img, v.sx, v.sy, v.w, v.h, dx, dy, w, h);
-  if (v2) {
-    // cross-fade into the next angle (same anchor maths for its own size)
-    const k2 = ((c.F / dz) * scale) / (VPC * v2.k);
-    ctx.globalAlpha = t * (opt.alpha ?? 1);
-    ctx.drawImage(v2.img, v2.sx, v2.sy, v2.w, v2.h, sx - v2.ax * k2, sy - v2.ay * k2, v2.w * k2, v2.h * k2);
-  }
+  if (opt.tilt) {
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(opt.tilt);
+    ctx.drawImage(v.img, v.sx, v.sy, v.w, v.h, dx - sx, dy - sy, w, h);
+    ctx.restore();
+  } else ctx.drawImage(v.img, v.sx, v.sy, v.w, v.h, dx, dy, w, h);
   ctx.globalAlpha = 1;
 }
 
@@ -560,6 +560,9 @@ function runnerHeight(s: RunState): number {
   return 0;
 }
 
+/** Largest lean of the runner sprite while changing lanes (radians, ≈ 14°). */
+const MAX_TILT = 0.25;
+
 function drawRunner(ctx: CanvasRenderingContext2D, c: Cam, s: RunState, fx: Fx): void {
   const x = fx.laneVis + 0.5;
   const z = s.pos;
@@ -582,7 +585,11 @@ function drawRunner(ctx: CanvasRenderingContext2D, c: Cam, s: RunState, fx: Fx):
     ctx.fill();
   }
   // lean into lane changes by turning the sprite slightly
-  billboard(ctx, c, entry, x, ground + up, z, { spin: (fx.laneVis - s.lane) * 0.5, shadow: flying ? 0 : 0.4, smooth: true });
+  // The runner always uses its one straight-ahead view: the camera only follows it part of the way, so drawn from the
+  // camera's angle it looked turned in the outer lanes. Lane changes show as a 2D lean of that single sprite (no second
+  // angle blended in, which left a ghost image).
+  const tilt = Math.max(-MAX_TILT, Math.min(MAX_TILT, (s.lane - fx.laneVis) * 0.3));
+  billboard(ctx, c, entry, x, ground + up, z, { facing: 0, tilt, shadow: flying ? 0 : 0.4 });
 }
 
 function drawParticles(ctx: CanvasRenderingContext2D, c: Cam, s: RunState, fx: Fx): void {
