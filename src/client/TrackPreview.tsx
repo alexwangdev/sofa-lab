@@ -11,7 +11,7 @@ import type { Course } from '../shared/types.ts';
 import { effectText, vehicleModel } from './models.ts';
 import { BiomeLegend, Thumb } from './Gallery.tsx';
 
-function cellColor(course: Course, row: number, col: number): string {
+export function cellColor(course: Course, row: number, col: number): string {
   const pal = BIOMES[biomeAt(course, row)].palette;
   const k = course.cells[row * COLS + col] ?? 0;
   switch (k) {

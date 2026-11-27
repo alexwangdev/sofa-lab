@@ -2,7 +2,9 @@
 import { useState } from 'react';
 import { LOCAL_USERS, readLocal, resetAll, resetDay, runScheduler, writeLocal } from './backend.ts';
 
-export function DevToolbar({ onChange, onModels, auto, onAuto }: { onChange: () => void; onModels: () => void; auto: boolean; onAuto: (on: boolean) => void }) {
+export type DevToolbarProps = { onChange: () => void; onModels: () => void; auto: boolean; onAuto: (on: boolean) => void };
+
+export function DevToolbar({ onChange, onModels, auto, onAuto }: DevToolbarProps) {
   const [s, setS] = useState(readLocal);
   const [msg, setMsg] = useState('');
   const update = (next: typeof s) => {

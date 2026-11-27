@@ -13,6 +13,8 @@ type AtlasView = [number, number, number, number, number, number, number, number
 type AtlasMeta = { biome: BiomeId; pages: string[]; items: Record<string, { lift: number; fit?: number; views: AtlasView[] }> };
 
 const loads = new Map<BiomeId, Promise<boolean>>();
+/** Cache-busting query for atlas files: changes whenever the baked atlases change (see vite.config.ts). */
+const V = `?v=${__ATLAS_VERSION__}`;
 
 /** Download progress per biome, for the loading hint (bytes when the server sends sizes, else pages). */
 type Progress = { state: 'loading' | 'ready' | 'failed'; got: number[]; size: number[]; done: number; since: number };
@@ -99,12 +101,12 @@ export function loadBiomeAtlas(biome: BiomeId): Promise<boolean> {
   progress.set(biome, prog);
   p = (async () => {
     const base = import.meta.env.BASE_URL;
-    const res = await fetch(`${base}atlas/${biome}.json`);
+    const res = await fetch(`${base}atlas/${biome}.json${V}`);
     if (!res.ok) return false;
     const meta = (await res.json()) as AtlasMeta;
     prog.got = meta.pages.map(() => 0);
     prog.size = meta.pages.map(() => 0);
-    const pages = await Promise.all(meta.pages.map((f, i) => loadPage(`${base}atlas/${f}`, prog, i)));
+    const pages = await Promise.all(meta.pages.map((f, i) => loadPage(`${base}atlas/${f}${V}`, prog, i)));
     warmUp(pages);
     const byKey = new Map(biomeCatalog(biome).map((i) => [i.entry.key, i.entry]));
     for (const [key, item] of Object.entries(meta.items)) {

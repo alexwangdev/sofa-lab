@@ -1,29 +1,37 @@
 {
   "private": true,
   "name": "grid-expedition",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "devvit playtest",
+    "login": "devvit login",
     "build": "npm run atlas && tsc --build && vite build",
-    "preview": "vite preview",
+    "web": "vite --config vite.web.config.ts",
+    "preweb": "npm run atlas",
+    "build:web": "npm run atlas && tsc --build && vite build --config vite.web.config.ts",
+    "preview": "vite preview --config vite.web.config.ts",
     "typecheck": "tsc --build",
     "test": "node --experimental-strip-types --no-warnings=ExperimentalWarning tests/acceptance.ts",
     "atlas": "node --experimental-strip-types --no-warnings=ExperimentalWarning tools/bake-atlas.ts",
-    "predev": "npm run atlas",
-    "autotest": "node --experimental-strip-types --no-warnings=ExperimentalWarning tools/autotest.ts"
+    "autotest": "node --experimental-strip-types --no-warnings=ExperimentalWarning tools/autotest.ts",
+    "winrate": "node --experimental-strip-types --no-warnings=ExperimentalWarning tools/winrate.ts"
   },
   "engines": {
     "node": ">=22.0.0"
   },
   "dependencies": {
+    "@devvit/start": "0.15.4",
+    "@devvit/web": "0.15.4",
+    "@hono/node-server": "^2.1.6",
+    "devvit": "0.15.4",
     "hono": "4.13.17",
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },
   "devDependencies": {
     "@tailwindcss/vite": "4.3.5",
-    "@types/node": "^24.13.3",
+    "@types/node": "^24.19.4",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "6.3.0",
@@ -31,5 +39,6 @@
     "tailwindcss": "4.3.5",
     "typescript": "6.0.3",
     "vite": "8.3.7"
-  }
+  },
+  "license": "BSD-3-Clause"
 }

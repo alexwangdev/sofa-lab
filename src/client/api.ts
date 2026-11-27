@@ -1,9 +1,9 @@
 /**
- * Fetch wrappers for spec §13. Standalone web build: requests are answered in the page by client/backend.ts.
- * Devvit build (later): replace `localFetch` with `fetch` — paths, bodies and responses are unchanged.
+ * Fetch wrappers for spec §13. On Reddit they go to the Devvit server; in the standalone web build they are answered in
+ * the page (see platform.ts). Paths, bodies and responses are the same either way.
  */
-import type { ErrorResponse, LeaderboardResponse, RunBody, RunResponse, TodayResponse } from '../shared/types.ts';
-import { localFetch } from './backend.ts';
+import type { EndlessRunBody, EndlessRunResponse, ErrorResponse, LeaderboardResponse, RunBody, RunResponse, TodayResponse } from '../shared/types.ts';
+import { apiFetch } from './platform.ts';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -14,7 +14,7 @@ export class ApiError extends Error {
 }
 
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await localFetch(path, { ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) } });
+  const res = await apiFetch(path, { ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) } });
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
     try {
@@ -31,4 +31,6 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
 export const getToday = (): Promise<TodayResponse> => call('/api/today');
 export const postRun = (body: RunBody): Promise<RunResponse> => call('/api/run', { method: 'POST', body: JSON.stringify(body) });
 export const getLeaderboard = (date: string): Promise<LeaderboardResponse> => call(`/api/leaderboard?date=${encodeURIComponent(date)}`);
+export const postEndless = (body: EndlessRunBody): Promise<EndlessRunResponse> => call('/api/endless', { method: 'POST', body: JSON.stringify(body) });
+export const getEndlessLeaderboard = (date: string): Promise<LeaderboardResponse> => call(`/api/endless-leaderboard?date=${encodeURIComponent(date)}`);
 export const postShare = (): Promise<{ ok: boolean; text: string }> => call('/api/share', { method: 'POST', body: '{}' });

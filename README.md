@@ -2,17 +2,29 @@
 
 A daily grid-runner built to SPEC v1.0. Everyone gets the same 450-row track each UTC day, and one run crosses three biomes drawn from a pool of 8. Pickups swap your vehicle for a few rows, and planning which ones to grab is the game. It uses the same grid engine and pseudo-3D projection as Ski Grid: Canvas 2D, voxel boxes, a single perspective divide, no 3D engine and no physics engine.
 
-**Current form: a plain React + TypeScript web app for testing. No Devvit, no backend.** The spec's server routes (`src/server/app.ts`) run inside the page (`src/client/backend.ts`) on an in-memory Redis that is saved to localStorage. The routes and data stay exactly as they will be on Devvit; the move later is described in [devvit/README.md](devvit/README.md).
+**Two builds from one codebase.**
+
+- **On Reddit (Devvit Web)**: `npm run build` → `dist/client` + `dist/server/index.cjs`. The routes in `src/server/app.ts` run on Devvit's server (`src/server/index.ts`) with Devvit's Redis, Reddit API and request context.
+- **Standalone web build for local testing**: `npm run web` / `npm run build:web` → `dist/web`. The same routes run inside the page (`src/client/backend.ts`) on an in-memory Redis saved to localStorage.
+- The only switch is `src/client/platform.ts`. On Reddit it uses plain `fetch` and has no TEST toolbar. The web config swaps in `platform.local.ts`, so no server code ever reaches the Reddit client bundle (Devvit's Vite plugin also refuses it).
 
 ```
 npm install
-npm run dev       # http://localhost:5177
-npm test          # spec §17 acceptance tests 1–9 + scoring and autopilot checks (node:test)
-npm run build     # tsc --build + vite build → dist/ (static files, relative paths; host anywhere)
-npm run preview   # serve dist/ on http://localhost:5178
+npm run web       # local test build with the TEST toolbar: http://localhost:5177
+npm test          # spec §17 acceptance tests 1–9 + scoring, replay, endless and autopilot checks (node:test)
+npm run dev       # devvit playtest: private upload + install to the dev subreddit, rebuilds on save
+npm run build     # Devvit build (what playtest / upload ship)
+npm run build:web # static web build → dist/web
 ```
 
-The dashed **TEST** bar under the controls lets you switch players (you / alice / bob / carol) to fill the leaderboard, set the UTC date to try other routes or test streaks, reset the day or all data, and fire the daily-post job. Reddit actions (flair, comment, daily post) are only logged to the browser console. "Share my run" copies the comment text to the clipboard.
+### On Reddit (private playtest)
+
+- **Upload**: the game is its own Devvit app, `grid-expedition` (registered with `devvit init`, `devvit.json` → `name`). It is uploaded as private versions and installed in the private test subreddit **r/gridexpedition_dev** (`dev.subreddit`).
+- **Open it**: `https://www.reddit.com/r/gridexpedition_dev/?playtest=grid-expedition`. Create today's post from the subreddit menu: "Grid Expedition: create today's post". The daily-post scheduler also runs at 00:00 UTC.
+- **Redis keys** are prefixed `ge:` (`ge:lb:`, `ge:user:`, `ge:streak:`, `ge:post:`, `ge:puzzle:`). This was added while the game briefly ran inside the old Sofa Lab app; it stays, so the keys are unambiguous.
+- **Private only**: keep the app playtest-only; do not run `devvit publish` (spec). Spec §17 test 10 (the manual playtest checklist) is run here.
+
+**Local test build only** (`npm run web`): the dashed **TEST** bar under the controls, the model gallery, auto mode and the `window.__*` dev hooks. Neither the Reddit build nor `npm run build:web` contains any of them; checked by searching an unminified build. The TEST bar lets you switch players (you / alice / bob / carol) to fill the leaderboard, set the UTC date to try other routes or test streaks, reset the day or all data, and fire the daily-post job. Reddit actions (flair, comment, daily post) are only logged to the browser console. "Share my run" copies the comment text to the clipboard.
 
 ## Scoring: time counts, but only if you finish
 
@@ -43,7 +55,7 @@ Models are built from basic shapes (box, cylinder, ellipsoid, cone, line, mirror
 Performance:
 - **Track length** is one constant, `ROWS` in `src/shared/grid.ts` (now 450 rows ≈ 900 m, three segments of 150). Segments, walls, gate widths, par, and the UI all derive from it. Stored puzzles record the length, so changing it recomputes par.
 - **Streaming**: the track data is ~4 KB and stays whole (the preview, minimap and server score check need it). What streams is the expensive part, the baked sprites. Models are tagged by biome. While the preview is open, the first two biomes bake in idle time (`prewarmCourse`). Entering a segment evicts the passed biome (views and fog tints freed) and queues the next one, so about two biomes of sprites exist at a time (about 3–5 megapixels). Row colour caches behind the runner are pruned. Shared and vehicle sprites unused for 20 s are dropped.
-- **Build-time atlases** (`npm run atlas`, also run by `dev` and `build`): `tools/bake-atlas.ts` builds every model in the catalog (`src/client/catalog.ts`) and rasterises every view it can be seen from. It uses the same pure-JS rasteriser as the game (`rasterize` in `voxel.ts`, no DOM, no canvas library), shelf-packs the views into ≤2048 px pages, and writes `atlas/<biome>.json` + `<biome>-<n>.webp`. The pages are encoded with sharp, a build-time dev dependency, as lossy WebP at quality 85 with lossless alpha. Result: 8 biomes, ~5,800 views, **5.0 MB** total in ~8 s. The old PNGs were 9.3 MB, and side by side at 3× zoom the two look the same. At run time the game downloads only the day's biomes, each just before its segment (≈0.4–0.8 MB each), and **never bakes** (0 runtime bakes measured). A missing angle uses the nearest atlas view. If an atlas is missing, the same catalog is baked in idle time instead. Trade-off: decoded atlas pages take ~12–26 MB per biome, with at most two biomes held at once. The generated files are git-ignored.
+- **Build-time atlases** (`npm run atlas`, also run by `dev` and `build`): `tools/bake-atlas.ts` builds every model in the catalog (`src/client/catalog.ts`) and rasterises every view it can be seen from. It uses the same pure-JS rasteriser as the game (`rasterize` in `voxel.ts`, no DOM, no canvas library), shelf-packs the views into ≤2048 px pages, and writes `atlas/<biome>.json` + `<biome>-<n>.webp`. The pages are encoded with sharp, a build-time dev dependency, as lossy WebP at quality 85 with lossless alpha. Result: 8 biomes, ~5,800 views, **5.0 MB** total in ~8 s. The old PNGs were 9.3 MB, and side by side at 3× zoom the two look the same. At run time the game downloads only the day's biomes, each just before its segment (≈0.4–0.8 MB each), and **never bakes** (0 runtime bakes measured). A missing angle uses the nearest atlas view. If an atlas is missing, the same catalog is baked in idle time instead. Trade-off: decoded atlas pages take ~12–26 MB per biome, with at most two biomes held at once. The generated files are git-ignored. Every atlas URL carries ?v=<hash of the baked files> (`__ATLAS_VERSION__`, set in vite.config.ts), so after a redeploy a browser never pairs a cached old page with a new index.
 - **Bake size follows distance**: far views (small pitch) bake at 1–2 px per voxel, near ones at up to 4. Views off-screen for a given depth are never preloaded.
 - **Per frame**: sparse off-track scenery (the column next to the track stays empty), one plain strip per side per row, lane grid lines as one stroke per row, cached colours and fill strings, a cached sky. At most ~6 ms of on-demand baking a frame; otherwise the nearest baked angle is shown and the right one bakes in idle time.
 - **Ground in one pass:** side strips and the lane base are long polygons (one per colour run). All special and checker cells are batched by colour, the grid and track edges are one stroke per colour, and boost arrows, slow ripples and hazard brackets are batched too. This cut ~500 fills and strokes per frame to a few dozen; per-row ground drawing had been most of the frame. The checker is only drawn within 22 rows.
@@ -119,6 +131,29 @@ The music is composed at run time as a 4-bar loop for each biome. Each biome has
 - **Scheduling**: notes are queued about 0.3 s ahead on the audio clock. A 50 ms timer tops the queue up as well as the render loop, so slow or throttled frames cause no gaps.
 - **Levels**: master 0.9, then a compressor; music bus 0.9. Measured during a run, music averages about −29 dB RMS against about −25 dB for the whole mix. Before this it was about −41 dB under a −32 dB mix, which is why it could not be heard.
 
+## First 15 seconds and sharing
+
+- **How to play** (`Intro.tsx`): three cards that advance by themselves every 5 s, so about 15 s in all; a tap moves on sooner.
+  1. **Switch lanes**: a small animated runner hops lanes.
+  2. **Read the ground**: the first biome's real sprites, with what each one does.
+  3. **Go fast, finish**: Tuck / Brake and par.
+  - It opens on the first visit; after that, from **How to play (15 s)** on the start card.
+- **Share image** (`shareCard.ts`, 1200 × 630, shown on the result card and saved with **Save image**):
+  - the whole day's track as a strip, with the exact path you took (the sim records the lane of every row) and 🏁 or 💥 where it ended;
+  - the three biome names, the score, time vs par or the crash distance, gates, and your rank of N.
+  - The score breakdown table is folded under **Score breakdown**.
+- **Share my run** posts a Wordle-style comment, built on the server from its replay of your best run:
+
+  ```
+  Grid Expedition 2026-11-22 · **6870**
+  🏙️✅ → 🏜️✅ → 🏔️✅
+  ⏱️ 27.3 s (par 49.3 s)
+  🚩 5 gates · ⭐ 62 · 🚁 1 ride
+  #1 of 1 today
+  ```
+
+  Each biome gets ✅ if you crossed it, 💥 if you crashed there, ⬜ if you never reached it. A streak of 2+ days adds 🔥.
+
 ## Models stay inside their cell
 
 - Every model gets a fit scale (`Entry.fit` in `voxel.ts`), measured from its voxels at bake time and stored in the atlas next to `lift`. Nothing is drawn wider than one cell, so no obstacle seems to block the next lane.
@@ -134,7 +169,12 @@ Open it with **Play endless** under the track preview. There is no finish line; 
 - **Difficulty**: every leg adds 2 % obstacle density, up to +25 % from leg 13 on.
 - **Same for everyone**: the endless track is fixed per date.
 - **Generated on demand**: the track is kept 200 rows ahead of the runner (`keepAhead`). Smashed and collected cells far behind are forgotten, because the autopilot copies them for every line it tries and long runs got slower and slower.
-- **Local only**: endless runs don't go to the server or the leaderboard. The best distance per date is stored in the browser. The HUD shows distance in metres and no par; the result card shows distance, time and today's best.
+- **Daily endless leaderboard**: ranked by distance, with its own Redis keys (`ge:elb:{date}`, `ge:euser:{user}:{date}`).
+  - `POST /api/endless { rows, inputs }` works like the daily score check. The server rebuilds the date's endless track and replays the inputs (`replayEndless`), up to 2 h of play.
+  - It stores the distance the replay reached. A claim that differs from the replay, a malformed log, or autopilot inputs get a 400.
+  - Replaying a 13-minute run takes about 35 ms.
+  - `GET /api/endless-leaderboard` returns the top 10 and your rank; `/api/today` also returns `myEndlessBest`.
+- **HUD and result card**: the HUD shows distance in metres and no par. The result card shows distance, time, today's best, your rank and the top 10.
 - **How far the autopilot gets**: `npm run autotest -- --endless --days 5 --max-legs 200`. Every leg keeps a guaranteed open lane and the autopilot looks 22 rows ahead, so it almost never crashes. Over 5 days with a 200-leg cap, 4 runs reached the cap: 90,000 rows, 180 km, about 88.5 min of play. One crashed in leg 155 (139 km, 68:44) on a Jungle crash cell with the ox cart, at the maximum +25 % density. Simulating a 200-leg run takes about 80 s.
 
 ## Timed vehicles last longer
@@ -167,7 +207,7 @@ src/client/Gallery.tsx  legend + model gallery
 src/client/…            App (HUD, result card, leaderboard), ExpeditionCanvas (loop + input),
                         render.ts (projection, ground marks, billboards), TrackPreview (preview + minimap)
 tests/acceptance.ts     §17 tests 1–9
-devvit/                 devvit.json + the Devvit server entry, parked until the move (see devvit/README.md)
+src/server/index.ts     Devvit server entry · devvit.json: app config · src/client/platform*.ts: Reddit vs local switch
 ```
 
 `sim.ts` is imported by both the client (the live run) and the server, which replays submitted runs with it. Vehicles have no code of their own; the sim only reads the flags in each row.
@@ -185,7 +225,8 @@ devvit/                 devvit.json + the Devvit server entry, parked until the 
   - `POST /api/run` sends only `{ score, seedCheck, inputs }`. The server rebuilds the day's track, reruns the whole run from the inputs with the same `sim.ts` (`replay`), and stores the replay's score.
   - The server rejects the run with a 400, and writes nothing, if the log is malformed (bad pairs, ticks out of order, unknown codes, over 40,000 numbers), if the run never ends within 10 minutes, or if the claimed score differs from the replay. A `seedCheck` mismatch gets a 409.
   - The sim uses only + − × ÷ and min/max, so the replay comes out bit-identical in every JS engine. `npm run autotest -- --all-routes --grab` replays all 336 runs and they match exactly.
-  - What it does not stop: a bot that plays well. That needs input-timing analysis, which is out of scope here.
+  - **Autopilot runs are refused.** Codes 6–10 are the autopilot's lane requests, which no player control produces, so a log containing them gets a 400 and nothing is stored. In dev, auto runs are not submitted at all.
+  - What it does not stop: a script that turns the autopilot's choices into ordinary left/right presses. That gives exactly the same run (the acceptance test does this conversion), and the server cannot tell it from a very good player. Catching it would take input-timing analysis, which is out of scope here.
   - The canvas draws between the last two ticks, so motion stays smooth at 60, 90, 120 or 144 Hz.
 - **Pause.**
   - Open it with the ❚❚ button on the track, or the P or Esc key. Leaving the page also pauses: switching tabs or apps, opening devtools, or a phone call.
@@ -208,5 +249,18 @@ devvit/                 devvit.json + the Devvit server entry, parked until the 
 - Played in the browser at 360 px and at desktop size: preview → run → crash → result card → retry → finish (3314) → leaderboard → share (copied) → reload keeps best and streak → switching players and the next UTC day work. There are no `/api` network requests, and the built `dist/` runs on a static server.
 - Still to do:
   - Try it on a real phone (touch, frame rate, iOS audio).
-  - Move it to Devvit and run §17 test 10 in a private subreddit (see devvit/README.md).
+  - Run §17 test 10 in r/gridexpedition_dev. The game is on Devvit now; see "On Reddit (private playtest)".
 - This repository previously held Sofa Lab. Its code is in the history at commit `827999c`.
+
+## Win rate by player skill (`npm run winrate`)
+
+Simulated players are the autopilot with a shorter look-ahead plus a random slip rate per row (any allowed lane instead of the planned one). They are models of skill, not real players. Over 40 days × 3 tries, from 2026-11-26:
+
+| Player | Daily: finish | Daily: beat par | Avg score | Endless: median (best) |
+|---|---|---|---|---|
+| Expert: 6 rows ahead, no slips, Tuck | 100 % | 100 % | 6871 | ≥ 9 km (all hit the 10-leg cap) |
+| Good: 4 rows, 1 % slips, Tuck | 63 % | 63 % | 4531 | 1.59 km (5.24 km) |
+| Casual: 3 rows, 3 % slips, no Tuck | 28 % | 19 % | 1635 | 0.53 km (2.01 km) |
+| Beginner: 2 rows, 6 % slips, no Tuck | 3 % | 3 % | 528 | 0.22 km (1.54 km) |
+
+Casual players crash around row 170, early in the second biome, where obstacle density passes about 10 %.

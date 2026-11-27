@@ -1,43 +1,12 @@
-// Standalone web build: plain React + Tailwind, no Devvit. The "server" routes run in the page (src/client/backend.ts).
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+// Devvit build (the game on Reddit): client → dist/client, server (src/server/index.ts) → dist/server/index.cjs.
+// The standalone web build for local testing is vite.web.config.ts (npm run web).
 import { defineConfig } from 'vite';
-import type { Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwind from '@tailwindcss/vite';
-
-/**
- * Dev-only: POST a data URL to /__dev/shot?name=x and it is written to .shots/x.jpg, so automated playtests can save
- * full-resolution canvas frames. Not part of the build.
- */
-function devShots(): Plugin {
-  return {
-    name: 'grid-expedition-dev-shots',
-    apply: 'serve',
-    configureServer(server) {
-      server.middlewares.use('/__dev/shot', (req, res) => {
-        const name = (new URL(req.url ?? '', 'http://x').searchParams.get('name') ?? 'shot').replace(/[^a-z0-9_-]/gi, '');
-        let body = '';
-        req.on('data', (c: Buffer) => (body += c.toString()));
-        req.on('end', () => {
-          const b64 = body.replace(/^data:image\/\w+;base64,/, '');
-          const dir = resolve(process.cwd(), '.shots');
-          mkdirSync(dir, { recursive: true });
-          const file = resolve(dir, `${name}.jpg`);
-          writeFileSync(file, Buffer.from(b64, 'base64'));
-          res.end(file);
-        });
-      });
-    },
-  };
-}
+import { devvit } from '@devvit/start/vite';
+import { atlasVersion } from './tools/vite-helpers.ts';
 
 export default defineConfig({
-  root: 'src/client',
-  // relative asset paths: dist/ works from any static host or sub-folder
-  base: './',
-  plugins: [react(), tailwind(), devShots()],
-  server: { port: 5177, strictPort: true },
-  preview: { port: 5178, strictPort: true },
-  build: { outDir: '../../dist', emptyOutDir: true },
+  define: { __ATLAS_VERSION__: JSON.stringify(atlasVersion()) },
+  plugins: [react(), tailwind(), devvit()],
 });

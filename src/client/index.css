@@ -22,3 +22,24 @@ body {
     @apply bg-slate-800 text-slate-100 active:bg-sky-700 touch-none;
   }
 }
+
+/* "How to play" intro: the runner hopping lanes, and each card's 5 s progress bar */
+@keyframes intro-hop {
+  0%, 15% { transform: translateX(0); }
+  25%, 45% { transform: translateX(100%); }
+  55%, 75% { transform: translateX(-100%); }
+  85%, 100% { transform: translateX(0); }
+}
+.intro-hop {
+  animation: intro-hop 2.4s ease-in-out infinite;
+}
+@keyframes intro-fill {
+  from { width: 0; }
+  to { width: 100%; }
+}
+.intro-fill {
+  animation: intro-fill 5s linear forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .intro-hop { animation: none; }
+}

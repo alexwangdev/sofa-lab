@@ -90,10 +90,16 @@ export type TodayResponse = {
   /** Has the caller played today (skip the preview on later runs). */
   playedToday: boolean;
   username: string | null;
+  /** Best endless distance today (rows), or null. */
+  myEndlessBest: number | null;
 };
 
 /** A finished or crashed run: the track checksum, the claimed score, and the input log the server replays (sim.ts). */
 export type RunBody = { score: number; seedCheck: number; inputs: number[] };
+
+/** An endless run: the distance reached (rows) and the input log the server replays (endless.ts). */
+export type EndlessRunBody = { rows: number; inputs: number[] };
+export type EndlessRunResponse = { rows: number; best: number; rank: number; improved: boolean };
 
 export type RunResponse = { score: number; best: number; rank: number | null; streak: number; improved: boolean };
 

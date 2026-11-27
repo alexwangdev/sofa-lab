@@ -15,6 +15,7 @@ import { dailyRoute, dailySeed, generateCourse } from './course.ts';
 import { hashSeed } from './rng.ts';
 import { Cell } from './types.ts';
 import type { BiomeId, Course } from './types.ts';
+import { computePar, newRun, startRun, tick, validLog } from './sim.ts';
 import type { RunState } from './sim.ts';
 
 /** Extra obstacle density per leg (the daily ramp is 5 % → 20 % inside each leg). */
@@ -22,7 +23,7 @@ export const LEG_DENSITY = 0.02;
 /** Cap on the extra density (leg 13 on), so the safe line stays the only gap only in the hardest stretches. */
 export const MAX_EXTRA = 0.25;
 /** Rows of track kept generated ahead of the runner (draw distance + autopilot look-ahead, with room to spare). */
-export const EXTEND_AHEAD = 200;
+const EXTEND_AHEAD = 200;
 
 export function newEndless(date: string): Course {
   const course: Course = {
@@ -86,3 +87,30 @@ export function keepAhead(s: RunState): void {
   }
 }
 const prunedAt = new WeakMap<RunState, number>();
+
+/** Longest endless run the server replays (2 h of play; replaying 13 min takes ~35 ms) and its longest input log. */
+export const ENDLESS_MAX_TICKS = 120 * 60 * 60 * 2;
+export const ENDLESS_MAX_LOG = 200_000;
+
+/**
+ * Rerun an endless run from its input log (server side), on the date's endless track. Returns the crashed run, or
+ * null if the log is malformed or the run has not ended within ENDLESS_MAX_TICKS.
+ */
+export function replayEndless(date: string, log: unknown): RunState | null {
+  if (!validLog(log, ENDLESS_MAX_TICKS, ENDLESS_MAX_LOG)) return null;
+  const s = newRun(newEndless(date), computePar());
+  startRun(s);
+  let i = 0;
+  const codes: number[] = [];
+  while (s.phase === 'run' && s.tick < ENDLESS_MAX_TICKS) {
+    keepAhead(s);
+    codes.length = 0;
+    while (i < log.length && log[i] === s.tick) {
+      codes.push(log[i + 1] ?? 0);
+      i += 2;
+    }
+    tick(s, codes);
+    s.events.length = 0;
+  }
+  return s.phase === 'crash' ? s : null;
+}

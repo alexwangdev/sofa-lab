@@ -67,6 +67,8 @@ export type RunState = {
   tick: number;
   held: Input;
   log: number[];
+  /** Lane of every row entered (index = row; rows a rocket hop skipped stay empty). Drawn on the share image. */
+  lanes: number[];
 };
 
 type Input = { fast: boolean; brake: boolean };
@@ -102,6 +104,7 @@ export function newRun(course: Course, parSeconds: number): RunState {
     tick: 0,
     held: { fast: false, brake: false },
     log: [],
+    lanes: [],
   };
 }
 
@@ -390,17 +393,27 @@ export function tick(s: RunState, codes: readonly number[], pilot?: (s: RunState
       }
     : undefined;
   step(s, TICK, s.held, rec);
+  s.lanes[s.row] = s.lane;
   s.tick++;
 }
 
+/** The log holds autopilot lane requests (codes 6–10). No player control produces them; the server refuses such runs. */
+export function hasPilotInputs(log: readonly unknown[]): boolean {
+  for (let i = 1; i < log.length; i += 2) {
+    const code = log[i];
+    if (typeof code === 'number' && code > IN.brakeOff) return true;
+  }
+  return false;
+}
+
 /** The input log is well formed: [tick, code] pairs, ticks in order and in range, known codes. */
-function validLog(log: unknown): log is number[] {
-  if (!Array.isArray(log) || log.length % 2 !== 0 || log.length > MAX_LOG) return false;
+export function validLog(log: unknown, maxTicks = MAX_TICKS, maxLog = MAX_LOG): log is number[] {
+  if (!Array.isArray(log) || log.length % 2 !== 0 || log.length > maxLog) return false;
   let last = 0;
   for (let i = 0; i < log.length; i += 2) {
     const t: unknown = log[i];
     const code: unknown = log[i + 1];
-    if (typeof t !== 'number' || !Number.isInteger(t) || t < last || t >= MAX_TICKS) return false;
+    if (typeof t !== 'number' || !Number.isInteger(t) || t < last || t >= maxTicks) return false;
     if (typeof code !== 'number' || !Number.isInteger(code) || code < 0 || code > PILOT + 2) return false;
     last = t;
   }

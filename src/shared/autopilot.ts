@@ -13,6 +13,9 @@ import type { Course } from './types.ts';
 
 const DEPTH = 6;
 const HORIZON = 16;
+/** Current search settings (set per call by decide / makePilot). */
+let depthNow = DEPTH;
+let horizonNow = HORIZON;
 
 function clone(s: RunState): RunState {
   return { ...s, broken: new Set(s.broken), taken: new Set(s.taken), events: [] };
@@ -38,7 +41,8 @@ function survivable(course: Course, row: number, lane: number, horizon: number):
 }
 
 /** Autopilot style. `pickupBonus` > 0 makes it go out of its way for vehicle pickups (to test every vehicle). */
-type PilotOptions = { pickupBonus?: number };
+/** depth / horizon: how far ahead it looks (rows searched, rows checked for a way through); less = a weaker player. */
+type PilotOptions = { pickupBonus?: number; depth?: number; horizon?: number };
 let pickupBonus = 0;
 
 /** Points a line is worth beyond the score: slow cells and poles cost time, which costs time score. */
@@ -54,9 +58,9 @@ function eventCost(s: RunState): number {
 }
 
 function value(s: RunState, depth: number, base: number): number {
-  if (s.phase === 'crash') return -1e6 + (DEPTH - depth) * 1000; // later crashes are less bad (more chances)
+  if (s.phase === 'crash') return -1e6 + (depthNow - depth) * 1000; // later crashes are less bad (more chances)
   if (s.phase === 'finish' || depth === 0) {
-    const safe = s.phase === 'finish' || survivable(s.course, s.row, s.lane, HORIZON);
+    const safe = s.phase === 'finish' || survivable(s.course, s.row, s.lane, horizonNow);
     return score(s).total - base + eventCost(s) + (safe ? 0 : -50_000);
   }
   let best = -Infinity;
@@ -76,6 +80,8 @@ function value(s: RunState, depth: number, base: number): number {
 export function makePilot(opts: PilotOptions = {}): (s: RunState, row: number) => number {
   return (s, row) => {
     pickupBonus = opts.pickupBonus ?? 0;
+    depthNow = opts.depth ?? DEPTH;
+    horizonNow = opts.horizon ?? HORIZON;
     return search(s, row);
   };
 }
@@ -83,6 +89,8 @@ export function makePilot(opts: PilotOptions = {}): (s: RunState, row: number) =
 /** The lane request for entering `row` next (what a player would have queued). Default style. */
 export function decide(s: RunState, row: number): number {
   pickupBonus = 0;
+  depthNow = DEPTH;
+  horizonNow = HORIZON;
   return search(s, row);
 }
 
@@ -94,7 +102,7 @@ function search(s: RunState, row: number): number {
   for (let d = -max; d <= max; d++) {
     const t = clone(s);
     enterRow(t, row, d);
-    const v = value(t, DEPTH - 1, base) - Math.abs(d) * 0.5;
+    const v = value(t, depthNow - 1, base) - Math.abs(d) * 0.5;
     if (v > best || (v === best && Math.abs(d) < Math.abs(bestReq))) {
       best = v;
       bestReq = d;

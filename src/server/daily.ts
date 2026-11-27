@@ -9,7 +9,7 @@ import type { RedisLike } from './ports.ts';
 /** `rows` records the track length the par was computed for; a stored puzzle for another length is recomputed. */
 export type Puzzle = { biomes: [BiomeId, BiomeId, BiomeId]; parSeconds: number; rows: number };
 
-export const kPuzzle = (date: string) => `puzzle:${date}`;
+export const kPuzzle = (date: string) => `ge:puzzle:${date}`;
 
 function parsePuzzle(raw: string | undefined): Puzzle | null {
   if (!raw) return null;

@@ -270,7 +270,8 @@ export const ExpeditionCanvas = memo(function ExpeditionCanvas({ active, course,
       const fx = fxRef.current;
       const before = s.phase;
       const h = held.current;
-      const pilot = pilotRef.current;
+      // the autopilot is a dev-server test tool: in a build this is the constant false and the autopilot is not bundled
+      const pilot = import.meta.env.DEV && pilotRef.current;
       if ((pilot || autoStartRef.current) && s.phase === 'ready' && readyToStart(biomeAt(s.course, 0))) {
         autoStartRef.current = false;
         startRun(s);

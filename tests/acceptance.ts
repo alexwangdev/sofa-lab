@@ -264,19 +264,39 @@ test('8. score check: the server replays the inputs; a fabricated score or a for
   assert.ok(r);
   assert.deepEqual([score(r).total, r.time, r.row, r.lane], [real, s.time, s.row, s.lane]);
 
+  // the same run as a player would send it: each autopilot lane request becomes that many left/right presses
+  const asPlayer = (log: number[]): number[] => {
+    const out: number[] = [];
+    for (let i = 0; i < log.length; i += 2) {
+      const [t, code] = [log[i] ?? 0, log[i + 1] ?? 0];
+      if (code <= IN.brakeOff) out.push(t, code);
+      else for (let n = 0; n < Math.abs(code - 8); n++) out.push(t, code < 8 ? IN.left : IN.right);
+    }
+    return out;
+  };
+  const player = asPlayer(s.log);
+  const rp = replay(course, today.parSeconds, player);
+  assert.ok(rp && score(rp).total === real, 'player-style log replays to the same run');
+
   const post = (o: unknown) => app.request('/api/run', { method: 'POST', body: JSON.stringify(o), headers: { 'Content-Type': 'application/json' } });
   const total = async () => ((await (await app.request(`/api/leaderboard?date=${date}`)).json()) as { total: number }).total;
-  assert.equal((await post({ score: real + 1, seedCheck: course.checksum, inputs: s.log })).status, 400, 'claimed more than the replay');
+  assert.equal((await post({ score: real, seedCheck: course.checksum, inputs: s.log })).status, 400, 'autopilot inputs are refused');
+  assert.equal((await post({ score: real + 1, seedCheck: course.checksum, inputs: player })).status, 400, 'claimed more than the replay');
   for (const inputs of [[1], [5, 0, 3, 0], [0, 99], [0.5, 0], 'x', new Array(MAX_LOG + 2).fill(0)])
     assert.equal((await post({ score: real, seedCheck: course.checksum, inputs })).status, 400, `inputs ${JSON.stringify(inputs).slice(0, 30)}`);
-  assert.equal((await post({ score: -1, seedCheck: course.checksum, inputs: s.log })).status, 400);
-  assert.equal((await post({ score: real, seedCheck: course.checksum + 1, inputs: s.log })).status, 409, 'wrong track');
+  assert.equal((await post({ score: -1, seedCheck: course.checksum, inputs: player })).status, 400);
+  assert.equal((await post({ score: real, seedCheck: course.checksum + 1, inputs: player })).status, 409, 'wrong track');
   assert.equal(await total(), 0, 'leaderboard unchanged');
 
-  const ok = await post({ score: real, seedCheck: course.checksum, inputs: s.log });
+  const ok = await post({ score: real, seedCheck: course.checksum, inputs: player });
   assert.equal(ok.status, 200);
   assert.equal(((await ok.json()) as { score: number }).score, real);
   assert.equal(await total(), 1);
+  // the share comment: Wordle-style summary of the verified best run
+  const shared = (await (await app.request('/api/share', { method: 'POST', body: '{}', headers: { 'Content-Type': 'application/json' } })).json()) as { text: string };
+  console.log(shared.text);
+  assert.match(shared.text, /✅ → .*✅ → .*✅/u);
+  assert.match(shared.text, /#1 of 1 today/);
 });
 
 // ---------- 9 ----------
@@ -371,4 +391,37 @@ test('endless: legs join without a finish line, the track is the same per date, 
   }
   assert.equal(s.phase, 'run', `crashed at row ${s.row}`);
   assert.ok(s.broken.size + s.taken.size < 400, 'cells far behind are forgotten');
+});
+
+test('endless leaderboard: the server replays the run on the endless track, ranks the distance, refuses fakes', async () => {
+  const redis = new MemoryRedis(null);
+  const date = '2026-11-26';
+  const app = createApp({
+    redis,
+    reddit: fakeReddit(() => undefined),
+    ctx: () => ({ userId: 't2_runner', username: async () => 'runner', postId: 't3_x', subredditName: 'sub', date }),
+  });
+  // a real endless run: hold Tuck, never steer → it crashes somewhere in the first leg
+  const s = newRun(newEndless(date), computePar());
+  startRun(s);
+  while (s.phase === 'run') {
+    keepAhead(s);
+    tick(s, s.tick === 0 ? [IN.fastOn] : []);
+    s.events.length = 0;
+  }
+  assert.equal(s.phase, 'crash');
+  const post = (o: unknown) => app.request('/api/endless', { method: 'POST', body: JSON.stringify(o), headers: { 'Content-Type': 'application/json' } });
+  assert.equal((await post({ rows: s.row + 50, inputs: s.log })).status, 400, 'claimed further than the replay');
+  assert.equal((await post({ rows: s.row, inputs: [0, 9] })).status, 400, 'autopilot inputs refused');
+  assert.equal((await post({ rows: s.row, inputs: 'x' })).status, 400);
+  const ok = await post({ rows: s.row, inputs: s.log });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { rows: s.row, best: s.row, rank: 1, improved: true });
+  const lb = (await (await app.request(`/api/endless-leaderboard?date=${date}`)).json()) as { total: number; top: { score: number }[] };
+  assert.equal(lb.total, 1);
+  assert.equal(lb.top[0]?.score, s.row);
+  const today = (await (await app.request('/api/today')).json()) as { myEndlessBest: number | null };
+  assert.equal(today.myEndlessBest, s.row);
+  // the daily board is separate
+  assert.equal(((await (await app.request(`/api/leaderboard?date=${date}`)).json()) as { total: number }).total, 0);
 });

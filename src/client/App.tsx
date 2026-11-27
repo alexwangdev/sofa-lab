@@ -7,15 +7,17 @@ import { ROWS, biomeAt, nextBoundary, segmentOf } from '../shared/grid.ts';
 import { METERS_PER_ROW, canControlSpeed, score } from '../shared/sim.ts';
 import type { RunState } from '../shared/sim.ts';
 import { vehicle } from '../shared/vehicles.ts';
-import type { LeaderboardResponse, Phase, RunResponse, ScoreParts, TodayResponse } from '../shared/types.ts';
-import { ApiError, getLeaderboard, getToday, postRun, postShare } from './api.ts';
+import type { Course, EndlessRunResponse, LeaderboardResponse, Phase, RunResponse, ScoreParts, TodayResponse } from '../shared/types.ts';
+import { ApiError, getEndlessLeaderboard, getLeaderboard, getToday, postEndless, postRun, postShare } from './api.ts';
 import { ExpeditionCanvas } from './ExpeditionCanvas.tsx';
 import type { CanvasHandle } from './ExpeditionCanvas.tsx';
 import { MiniMap, TrackPreview } from './TrackPreview.tsx';
 import { prewarmCourse } from './render.ts';
+import { drawShareCard } from './shareCard.ts';
+import { Intro, introSeen } from './Intro.tsx';
 import { newEndless } from '../shared/endless.ts';
 import { atlasLoading, readyToStart } from './atlas.ts';
-import { DevToolbar } from './DevToolbar.tsx';
+import { DevToolbar } from './platform.ts';
 import { Gallery } from './Gallery.tsx';
 import { setSoundMode, soundMode } from './sfx.ts';
 import type { SoundMode } from './sfx.ts';
@@ -69,27 +71,6 @@ function loadingOf(s: RunState, next: number | undefined): Hud['loading'] {
   }
   return null;
 }
-const ENDLESS_KEY = 'grid-expedition:endless-best';
-/** Best endless distance (rows) per date, kept in this browser only. */
-function endlessBest(date: string): number {
-  try {
-    return (JSON.parse(localStorage.getItem(ENDLESS_KEY) ?? '{}') as Record<string, number>)[date] ?? 0;
-  } catch {
-    return 0;
-  }
-}
-function saveEndlessBest(date: string, rows: number): boolean {
-  if (rows <= endlessBest(date)) return false;
-  try {
-    const all = JSON.parse(localStorage.getItem(ENDLESS_KEY) ?? '{}') as Record<string, number>;
-    all[date] = rows;
-    localStorage.setItem(ENDLESS_KEY, JSON.stringify(all));
-  } catch {
-    /* storage full / private mode */
-  }
-  return true;
-}
-
 type Result = {
   phase: 'crash' | 'finish';
   parts: ScoreParts;
@@ -98,8 +79,10 @@ type Result = {
   time: number;
   server: RunResponse | null;
   error: string | null;
-  /** Endless runs: best distance (rows) today in this browser, and whether this run set it. */
-  endless?: { best: number; improved: boolean };
+  /** Lane per row (the path drawn on the share image). */
+  lanes: number[];
+  /** Endless runs: the server's verdict (null while saving) and today's endless board. */
+  endless?: { server: EndlessRunResponse | null; board: LeaderboardResponse | null };
 };
 
 const route = (t: TodayResponse) => t.biomes.map((b) => BIOMES[b].name).join(' → ');
@@ -128,6 +111,8 @@ export function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [screen, setScreen] = useState<'preview' | 'run' | 'gallery'>('preview');
   const [mode, setMode] = useState<'daily' | 'endless'>('daily');
+  // the 15-second how-to-play: on the first visit, and from the How to play link
+  const [intro, setIntro] = useState(() => !introSeen());
   const [run, setRun] = useState({ key: 0, auto: false });
   const [hud, setHud] = useState<Hud | null>(null);
   const [result, setResult] = useState<Result | null>(null);
@@ -141,6 +126,7 @@ export function App() {
     getToday()
       .then((t) => {
         setToday(t);
+        setMode('daily'); // a (re)load always starts from the day's track, never mid-endless
         setScreen(t.playedToday ? 'run' : 'preview');
         setResult(null);
         setRun((r) => ({ key: r.key + 1, auto: false }));
@@ -176,11 +162,25 @@ export function App() {
     (s: RunState) => {
       if (!today || !course) return;
       const parts = score(s);
-      const base: Result = { phase: s.phase === 'finish' ? 'finish' : 'crash', parts, distance: s.row, gates: s.gates, time: s.time, server: null, error: null };
+      const base: Result = { phase: s.phase === 'finish' ? 'finish' : 'crash', parts, distance: s.row, gates: s.gates, time: s.time, server: null, error: null, lanes: s.lanes.slice() };
+      if (import.meta.env.DEV && autoRef.current) {
+        // test runs by the autopilot never reach the leaderboard (the server would refuse them anyway)
+        setResult({ ...base, error: 'Auto run (test): not submitted.' });
+        return;
+      }
       if (course.endless) {
-        // local only: no server, no leaderboard
-        const improved = saveEndlessBest(today.date, s.row);
-        setResult({ ...base, endless: { best: endlessBest(today.date), improved } });
+        // the server replays the run on the day's endless track and ranks the distance it reached
+        const start: Result = { ...base, endless: { server: null, board: null } };
+        setResult(start);
+        const board = () => getEndlessLeaderboard(today.date).catch(() => null);
+        postEndless({ rows: s.row, inputs: s.log })
+          .then(async (server) => {
+            setResult({ ...start, endless: { server, board: await board() } });
+            setToday((t) => (t ? { ...t, myEndlessBest: server.best } : t));
+          })
+          .catch(async (e: unknown) =>
+            setResult({ ...start, error: e instanceof ApiError && e.status === 401 ? 'Log in to Reddit to save your distance.' : e instanceof Error ? e.message : String(e), endless: { server: null, board: await board() } }),
+          );
         return;
       }
       setResult(base);
@@ -202,6 +202,8 @@ export function App() {
   );
   // Auto mode (TEST bar): the autopilot drives; after each result it starts the next run by itself
   const [autoPilot, setAutoPilot] = useState(false);
+  const autoRef = useRef(false);
+  autoRef.current = autoPilot;
   useEffect(() => {
     if (!autoPilot || !result) return;
     const t = window.setTimeout(() => {
@@ -270,7 +272,7 @@ export function App() {
           <section className="mt-3 rounded-xl bg-slate-800/70 p-3 flex items-center justify-between gap-3">
             <div className="min-w-0">
               <p className="font-bold">Endless</p>
-              <p className="text-xs text-slate-400">No finish line. Every 450 rows brings three new biomes and more obstacles. Best today: {endlessBest(today.date) * METERS_PER_ROW} m</p>
+              <p className="text-xs text-slate-400">No finish line. Every 450 rows brings three new biomes and more obstacles. {today.myEndlessBest !== null ? `Your best today: ${today.myEndlessBest * METERS_PER_ROW} m` : 'Daily leaderboard by distance.'}</p>
             </div>
             <button className="btn btn-secondary shrink-0" onClick={() => playMode('endless')}>
               Play endless
@@ -284,19 +286,36 @@ export function App() {
         <div className={screen === 'run' ? 'contents' : 'hidden'}>
           <HudBar hud={hud} endless={endless} />
           <main className="relative w-full max-w-[480px]">
-            <ExpeditionCanvas key={run.key} ref={canvas} active={screen === 'run'} course={course} parSeconds={today.parSeconds} autoStart={run.auto} autoPilot={autoPilot} onTick={onTick} onEnd={onEnd} onRetry={retry} />
+            <ExpeditionCanvas key={run.key} ref={canvas} active={screen === 'run'} course={course} parSeconds={today.parSeconds} autoStart={run.auto} autoPilot={import.meta.env.DEV && autoPilot} onTick={onTick} onEnd={onEnd} onRetry={retry} />
             {hud?.phase === 'ready' && !result && (
               <Overlay>
-                <p className="text-xl font-extrabold">{endless ? 'Endless: how far can you go?' : `${BIOMES[today.biomes[0]].name} first`}</p>
-                <p className="text-sm text-slate-300 text-center max-w-64">
-                  {endless
-                    ? 'No finish line. Every 450 rows: three new biomes and more obstacles. One crash ends the run.'
-                    : 'One lane per row. Crash cells end the run. Finish faster for a bigger time score (only if you reach the finish). Grab pickups to change how you move.'}
-                </p>
-                <button className="btn btn-primary text-base px-6" disabled={!hud.canStart} onClick={() => canvas.current?.start()}>
-                  {hud.canStart ? 'Start' : `Loading ${hud.loading?.name ?? ''} ${hud.loading?.pct ?? 0}%`}
-                </button>
-                <p className="text-xs text-slate-400">Space · ← → lanes · ↑ tuck · ↓ brake</p>
+                {intro ? (
+                  <Intro
+                    biome={today.biomes[0]}
+                    canStart={hud.canStart}
+                    onStart={() => {
+                      setIntro(false);
+                      canvas.current?.start();
+                    }}
+                    onClose={() => setIntro(false)}
+                  />
+                ) : (
+                  <>
+                    <p className="text-xl font-extrabold">{endless ? 'Endless: how far can you go?' : `${BIOMES[today.biomes[0]].name} first`}</p>
+                    <p className="text-sm text-slate-300 text-center max-w-64">
+                      {endless
+                        ? 'No finish line. Every 450 rows: three new biomes and more obstacles. One crash ends the run.'
+                        : 'One lane per row. Crash cells end the run. Finish faster for a bigger time score (only if you reach the finish). Grab pickups to change how you move.'}
+                    </p>
+                    <button className="btn btn-primary text-base px-6" disabled={!hud.canStart} onClick={() => canvas.current?.start()}>
+                      {hud.canStart ? 'Start' : `Loading ${hud.loading?.name ?? ''} ${hud.loading?.pct ?? 0}%`}
+                    </button>
+                    <p className="text-xs text-slate-400">Space · ← → lanes · ↑ tuck · ↓ brake</p>
+                    <button className="text-xs text-sky-300 underline underline-offset-2 cursor-pointer" onClick={() => setIntro(true)}>
+                      How to play (15 s)
+                    </button>
+                  </>
+                )}
               </Overlay>
             )}
             {hud?.phase === 'run' && hud.loading && (
@@ -304,7 +323,7 @@ export function App() {
                 Loading {hud.loading.name} · {hud.loading.pct}%
               </p>
             )}
-            {result && (result.endless ? <EndlessResult result={result} onRetry={retry} /> : <ResultCard result={result} today={today} board={board} shared={shared} onShare={share} onRetry={retry} />)}
+            {result && (result.endless ? <EndlessResult result={result} onRetry={retry} /> : <ResultCard result={result} course={course} today={today} board={board} shared={shared} onShare={share} onRetry={retry} />)}
           </main>
           {!endless && (
             <div className="w-full max-w-[480px]">
@@ -319,20 +338,25 @@ export function App() {
           </nav>
         </div>
       )}
-      {/* standalone test build: the test toolbar is always on (remove it in the Devvit build) */}
-      {screen === 'gallery' && <Gallery onClose={() => setScreen('preview')} />}
-      <DevToolbar
-        onChange={load}
-        onModels={() => setScreen('gallery')}
-        auto={autoPilot}
-        onAuto={(on) => {
-          setAutoPilot(on);
-          if (on) setScreen('run');
-        }}
-      />
+      {/* test toolbar, model gallery and autopilot: dev server only (npm run dev); the built game has none of them */}
+      {import.meta.env.DEV && screen === 'gallery' && <Gallery onClose={() => setScreen('preview')} />}
+      {import.meta.env.DEV && DevToolbar && (
+        <DevToolbar
+          onChange={load}
+          onModels={() => setScreen('gallery')}
+          auto={autoPilot}
+          onAuto={(on) => {
+            setAutoPilot(on);
+            if (on) setScreen('run');
+          }}
+        />
+      )}
     </div>
   );
 }
+
+/** m:ss for long (endless) runs. */
+const clock = (t: number) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
 
 function HudBar({ hud, endless }: { hud: Hud | null; endless: boolean }) {
   const cell = 'rounded-md bg-slate-800 px-1.5 py-1 leading-tight min-w-0';
@@ -343,7 +367,7 @@ function HudBar({ hud, endless }: { hud: Hud | null; endless: boolean }) {
       <div className={cell}>
         <p className="text-slate-400">Time</p>
         <p className={`text-base font-bold ${slow ? 'text-amber-400' : ''}`} title="Finish faster than par for more than 3000 time points">
-          {(hud?.time ?? 0).toFixed(1)}
+          {endless ? clock(hud?.time ?? 0) : (hud?.time ?? 0).toFixed(1)}
           {!endless && <span className="text-slate-400 text-xs">/{Math.round(hud?.par ?? 0)}</span>}
         </p>
       </div>
@@ -396,20 +420,51 @@ function Overlay({ children }: { children: ReactNode }) {
   );
 }
 
+/** Top 10 of a daily board, plus the caller if lower. `fmt` formats a score (points, or metres for endless). */
+function BoardList({ board, fmt = String }: { board: LeaderboardResponse | null; fmt?: (n: number) => string }) {
+  if (!board || board.top.length === 0) return null;
+  return (
+    <ol className="w-full max-w-64 text-xs tabular-nums">
+      {board.top.map((e) => (
+        <li key={e.rank} className="flex justify-between gap-2">
+          <span className="truncate">
+            #{e.rank} {e.username}
+          </span>
+          <span className="font-semibold">{fmt(e.score)}</span>
+        </li>
+      ))}
+      {board.me && board.me.rank > 10 && (
+        <li className="flex justify-between gap-2 text-orange-300">
+          <span>#{board.me.rank} you</span>
+          <span className="font-semibold">{fmt(board.me.best)}</span>
+        </li>
+      )}
+    </ol>
+  );
+}
+
+const metres = (rows: number) => `${rows * METERS_PER_ROW} m`;
+
 function EndlessResult({ result: r, onRetry }: { result: Result; onRetry: () => void }) {
-  const best = r.endless?.best ?? 0;
+  const server = r.endless?.server ?? null;
   return (
     <Overlay>
       <p className="text-2xl font-extrabold text-red-400">Crashed</p>
-      <p className="text-4xl font-black tabular-nums -mt-1">{r.distance * METERS_PER_ROW} m</p>
+      <p className="text-4xl font-black tabular-nums -mt-1">{metres(r.distance)}</p>
       <p className="text-sm text-slate-300 tabular-nums">
-        {r.distance} rows · {Math.floor(r.time / 60)}:{String(Math.floor(r.time % 60)).padStart(2, '0')} · {r.parts.total} points
+        {r.distance} rows · {clock(r.time)} · {r.parts.total} points
       </p>
-      <p className="text-xs text-slate-300">
-        Best today <b>{best * METERS_PER_ROW} m</b>
-        {r.endless?.improved && <span className="text-orange-400"> · new best</span>}
-      </p>
-      <p className="text-xs text-slate-500">Endless runs stay on this device (no leaderboard).</p>
+      {server ? (
+        <p className="text-xs text-slate-300 text-center">
+          Best today <b>{metres(server.best)}</b>
+          {server.improved && <span className="text-orange-400"> · new best</span>} · rank <b>#{server.rank}</b>
+        </p>
+      ) : r.error ? (
+        <p className="text-xs text-red-300 text-center max-w-64">{r.error}</p>
+      ) : (
+        <p className="text-xs text-slate-400">Saving…</p>
+      )}
+      <BoardList board={r.endless?.board ?? null} fmt={metres} />
       <button className="btn btn-primary px-5" onClick={onRetry}>
         Retry
       </button>
@@ -417,9 +472,26 @@ function EndlessResult({ result: r, onRetry }: { result: Result; onRetry: () => 
   );
 }
 
-function ResultCard(props: { result: Result; today: TodayResponse; board: LeaderboardResponse | null; shared: string; onShare: () => void; onRetry: () => void }) {
-  const { result: r, today, board, shared } = props;
+function ResultCard(props: { result: Result; course: Course; today: TodayResponse; board: LeaderboardResponse | null; shared: string; onShare: () => void; onRetry: () => void }) {
+  const { result: r, course, today, board, shared } = props;
   const fin = r.phase === 'finish';
+  // the share image: whole track + this run's path + score, time and rank (redrawn once the rank is known)
+  const card = useMemo(
+    () =>
+      drawShareCard({
+        course,
+        lanes: r.lanes,
+        finished: fin,
+        row: r.distance,
+        score: r.parts.total,
+        time: r.time,
+        par: today.parSeconds,
+        gates: r.gates,
+        rank: r.server?.rank ?? null,
+        total: board?.total ?? null,
+      }),
+    [course, r, fin, today.parSeconds, board],
+  );
   const row = (k: string, v: number | string) => (
     <tr key={k}>
       <td className="pr-4 text-slate-300">{k}</td>
@@ -428,9 +500,11 @@ function ResultCard(props: { result: Result; today: TodayResponse; board: Leader
   );
   return (
     <Overlay>
-      <p className={`text-2xl font-extrabold ${fin ? 'text-green-400' : 'text-red-400'}`}>{fin ? '✓ Finished' : 'Crashed'}</p>
-      <p className="text-4xl font-black tabular-nums -mt-1">{r.parts.total}</p>
-      <table className="text-sm tabular-nums">
+      <p className={`text-xl font-extrabold ${fin ? 'text-green-400' : 'text-red-400'}`}>{fin ? '✓ Finished' : 'Crashed'}</p>
+      {card && <img src={card} alt={`Run summary: ${r.parts.total} points`} className="w-full max-w-80 rounded-lg shadow-lg" />}
+      <details className="text-xs text-slate-300">
+        <summary className="cursor-pointer text-center">Score breakdown</summary>
+        <table className="text-sm tabular-nums">
         <tbody>
           {row(`Distance ${r.distance}/${ROWS} · ${r.distance * METERS_PER_ROW} m`, r.parts.rows)}
           {row(`Gates ${r.gates}`, r.parts.gates)}
@@ -440,6 +514,7 @@ function ResultCard(props: { result: Result; today: TodayResponse; board: Leader
           {fin ? row(`Time ${r.time.toFixed(1)} s (par ${today.parSeconds} s)`, r.parts.finish) : row('Time score: finish to earn it', '—')}
         </tbody>
       </table>
+      </details>
       {r.server ? (
         <p className="text-xs text-slate-300 text-center">
           Best today <b>{r.server.best}</b>
@@ -450,31 +525,19 @@ function ResultCard(props: { result: Result; today: TodayResponse; board: Leader
       ) : (
         <p className="text-xs text-slate-400">Saving…</p>
       )}
-      {board && board.top.length > 0 && (
-        <ol className="w-full max-w-64 text-xs tabular-nums">
-          {board.top.map((e) => (
-            <li key={e.rank} className="flex justify-between gap-2">
-              <span className="truncate">
-                #{e.rank} {e.username}
-              </span>
-              <span className="font-semibold">{e.score}</span>
-            </li>
-          ))}
-          {board.me && board.me.rank > 10 && (
-            <li className="flex justify-between gap-2 text-orange-300">
-              <span>#{board.me.rank} you</span>
-              <span className="font-semibold">{board.me.best}</span>
-            </li>
-          )}
-        </ol>
-      )}
+      <BoardList board={board} />
       <div className="flex gap-2">
         <button className="btn btn-primary px-5" onClick={props.onRetry}>
           Retry
         </button>
         <button className="btn btn-secondary" disabled={!r.server || shared === 'busy' || shared === 'done'} onClick={props.onShare}>
-          {shared === 'done' ? 'Copied ✓' : shared === 'error' ? 'Share failed, retry' : 'Share my run'}
+          {shared === 'done' ? 'Shared ✓' : shared === 'error' ? 'Share failed, retry' : 'Share my run'}
         </button>
+        {card && (
+          <a className="btn btn-secondary" href={card} download={`grid-expedition-${today.date}.png`}>
+            Save image
+          </a>
+        )}
       </div>
     </Overlay>
   );

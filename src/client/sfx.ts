@@ -93,7 +93,7 @@ export function audioOut(): { c: AudioContext; master: GainNode } | null {
 
 /** at: seconds from now, or when: absolute context time; out: destination (default the master bus). */
 type When = { at?: number; when?: number; out?: AudioNode };
-export type ToneOpts = When & { type?: OscillatorType; vol?: number; attack?: number };
+type ToneOpts = When & { type?: OscillatorType; vol?: number; attack?: number };
 /** Oscillator from f0 to f1 Hz over dur seconds with a fast attack and exponential decay. */
 export function tone(f0: number, f1: number, dur: number, { type = 'square', vol = 0.15, at = 0, when, out, attack = 0.005 }: ToneOpts = {}): void {
   const c = live();

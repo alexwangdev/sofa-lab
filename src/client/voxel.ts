@@ -387,7 +387,7 @@ export class Entry {
 /** Longest a vehicle may be along the track, in cells (sleds and trains are long; a cell is the lane's width). */
 const FIT_VEHICLE_DEPTH = 2.5;
 /** Filled extent of a model across (x) and along (z) the track, in cells. */
-export function footprint(m: Model): { w: number; d: number } {
+function footprint(m: Model): { w: number; d: number } {
   let x0 = Infinity;
   let x1 = -Infinity;
   let z0 = Infinity;
@@ -403,7 +403,7 @@ export function footprint(m: Model): { w: number; d: number } {
         }
   return x1 < x0 ? { w: 0, d: 0 } : { w: (x1 - x0 + 1) / VPC, d: (z1 - z0 + 1) / VPC };
 }
-export function fitFor(m: Model, maxDepth: number): number {
+function fitFor(m: Model, maxDepth: number): number {
   const f = footprint(m);
   return Math.min(1, f.w > 0 ? 1 / f.w : 1, f.d > 0 ? maxDepth / f.d : 1);
 }

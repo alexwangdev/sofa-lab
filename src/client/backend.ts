@@ -91,7 +91,7 @@ export function localFetch(path: string, init?: RequestInit): Promise<Response> 
 /** Test helpers for the dev toolbar. */
 export function resetDay(): number {
   const { date } = ctx();
-  const n = redis.deleteWhere((k) => k === kLb(date) || k === kPost(date) || k === kPuzzle(date) || (k.startsWith('user:') && k.endsWith(`:${date}`)));
+  const n = redis.deleteWhere((k) => k === kLb(date) || k === kPost(date) || k === kPuzzle(date) || (k.startsWith('ge:user:') && k.endsWith(`:${date}`)));
   record('reset', `${date} (${n} keys)`);
   return n;
 }
